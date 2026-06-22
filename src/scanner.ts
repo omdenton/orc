@@ -1,0 +1,147 @@
+import { readFileSync, statSync, readdirSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+
+export const PROJECTS_DIR = join(homedir(), '.claude', 'projects');
+
+export interface Session {
+  /** session UUID — the value passed to `claude --resume` */
+  id: string;
+  /** absolute path to the .jsonl transcript */
+  path: string;
+  /** working directory the session ran in (where we relaunch) */
+  cwd: string;
+  /** human-readable title (aiTitle, or a prompt fallback) */
+  title: string;
+  /** last user prompt, for the detail pane */
+  lastPrompt: string;
+  gitBranch: string;
+  permissionMode: string;
+  messageCount: number;
+  /** file mtime in ms — drives freshness + "running" detection */
+  mtimeMs: number;
+  /** type of the final transcript record */
+  lastType: string;
+}
+
+interface CacheEntry {
+  mtimeMs: number;
+  session: Session;
+}
+
+// Parsed metadata is cached by mtime so the 2s poll only re-reads changed files.
+const cache = new Map<string, CacheEntry>();
+
+function truncate(s: string, n: number): string {
+  const clean = (s || '').replace(/\s+/g, ' ').trim();
+  return clean.length > n ? clean.slice(0, n - 1) + '…' : clean;
+}
+
+function textFromContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const t = content.find((x: any) => x && x.type === 'text' && typeof x.text === 'string');
+    if (t) return (t as any).text;
+  }
+  return '';
+}
+
+function parseFile(path: string, mtimeMs: number): Session {
+  const id = path.split('/').pop()!.replace(/\.jsonl$/, '');
+  let cwd = '';
+  let title = '';
+  let lastPrompt = '';
+  let gitBranch = '';
+  let permissionMode = '';
+  let messageCount = 0;
+  let lastType = '';
+  let firstUserText = '';
+
+  let text = '';
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch {
+    /* unreadable — return what we have */
+  }
+
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let r: any;
+    try {
+      r = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (r.type) lastType = r.type;
+    if (!cwd && typeof r.cwd === 'string') cwd = r.cwd;
+    if (typeof r.gitBranch === 'string') gitBranch = r.gitBranch;
+    if (typeof r.messageCount === 'number' && r.messageCount > messageCount) {
+      messageCount = r.messageCount;
+    }
+    if (r.type === 'ai-title' && r.aiTitle) title = r.aiTitle;
+    if (r.type === 'last-prompt') lastPrompt = r.lastPrompt || r.content || lastPrompt;
+    if (r.type === 'permission-mode' && r.permissionMode) permissionMode = r.permissionMode;
+    if (!firstUserText && r.type === 'user' && r.message) {
+      firstUserText = textFromContent(r.message.content);
+    }
+  }
+
+  if (!title) title = truncate(lastPrompt || firstUserText || id, 60);
+
+  return {
+    id,
+    path,
+    cwd: cwd || homedir(),
+    title,
+    lastPrompt: truncate(lastPrompt || firstUserText, 240),
+    gitBranch,
+    permissionMode,
+    messageCount,
+    mtimeMs,
+    lastType,
+  };
+}
+
+/** Scan ~/.claude/projects for all sessions, newest-first. mtime-cached. */
+export function scanSessions(): Session[] {
+  const out: Session[] = [];
+  if (!existsSync(PROJECTS_DIR)) return out;
+
+  let projectDirs: string[] = [];
+  try {
+    projectDirs = readdirSync(PROJECTS_DIR);
+  } catch {
+    return out;
+  }
+
+  for (const pd of projectDirs) {
+    const dir = join(PROJECTS_DIR, pd);
+    let files: string[] = [];
+    try {
+      files = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!f.endsWith('.jsonl')) continue;
+      const p = join(dir, f);
+      let st;
+      try {
+        st = statSync(p);
+      } catch {
+        continue;
+      }
+      const cached = cache.get(p);
+      if (cached && cached.mtimeMs === st.mtimeMs) {
+        out.push(cached.session);
+        continue;
+      }
+      const session = parseFile(p, st.mtimeMs);
+      cache.set(p, { mtimeMs: st.mtimeMs, session });
+      out.push(session);
+    }
+  }
+
+  out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return out;
+}
