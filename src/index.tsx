@@ -158,8 +158,14 @@ function shortPath(p: string): string {
   return p.startsWith(HOME) ? '~' + p.slice(HOME.length) : p;
 }
 
+// Truncate to width, breaking on a word boundary when one is reasonably close,
+// then pad so the selection highlight fills the row.
 function pad(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n - 1) + '…' : s.padEnd(n);
+  if (s.length <= n) return s.padEnd(n);
+  const slice = s.slice(0, n - 1);
+  const sp = slice.lastIndexOf(' ');
+  const base = sp >= Math.floor(n * 0.6) ? slice.slice(0, sp) : slice;
+  return (base + '…').padEnd(n);
 }
 
 function StatusGlyph({ status }: { status: RowStatus }) {
@@ -179,8 +185,9 @@ function StatusGlyph({ status }: { status: RowStatus }) {
   return <Text color="gray">✓</Text>;
 }
 
-// Fixed (non-list) lines: header, hint, blank, cwd block (blank + line).
-const CHROME_LINES = 5;
+// Fixed (non-list) lines: header, hint, blank, then the detail block
+// (blank + up to 2 title lines + cwd), with a line of slack.
+const CHROME_LINES = 8;
 
 function Dashboard() {
   const { stdout } = useStdout();
@@ -408,7 +415,11 @@ function Dashboard() {
       </Box>
 
       {selected && (
-        <Box marginTop={1} width={dims.cols}>
+        <Box flexDirection="column" marginTop={1} width={dims.cols}>
+          {/* full name of the highlighted session — context the row can't fit */}
+          <Box height={2} overflow="hidden">
+            <Text>{selected.title}</Text>
+          </Box>
           <Text dimColor wrap="truncate">
             {shortPath(selected.cwd)}
           </Text>
