@@ -22,6 +22,10 @@ export interface Session {
   mtimeMs: number;
   /** type of the final transcript record */
   lastType: string;
+  /** true when the last *conversational* record is a user turn with no
+   *  assistant reply yet — i.e. a turn is in flight. Used (gated on recency) to
+   *  tell a session that's actively generating from a dormant one. */
+  awaitingReply: boolean;
 }
 
 interface CacheEntry {
@@ -66,6 +70,7 @@ function parseFile(path: string, mtimeMs: number): Session {
   let permissionMode = '';
   let messageCount = 0;
   let lastType = '';
+  let lastRole = ''; // role of the last user/assistant record (ignores metadata lines)
   let firstUserText = '';
 
   let text = '';
@@ -84,6 +89,7 @@ function parseFile(path: string, mtimeMs: number): Session {
       continue;
     }
     if (r.type) lastType = r.type;
+    if (r.type === 'user' || r.type === 'assistant') lastRole = r.type;
     if (!cwd && typeof r.cwd === 'string') cwd = r.cwd;
     if (typeof r.gitBranch === 'string') gitBranch = r.gitBranch;
     if (typeof r.messageCount === 'number' && r.messageCount > messageCount) {
@@ -114,6 +120,7 @@ function parseFile(path: string, mtimeMs: number): Session {
     messageCount,
     mtimeMs,
     lastType,
+    awaitingReply: lastRole === 'user',
   };
 }
 

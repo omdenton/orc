@@ -45,6 +45,7 @@ export interface PaneInfo {
   cmd: string;
   cwd: string;
   dead: boolean; // process exited but pane kept (remain-on-exit)
+  born: string; // @orc_born: ms timestamp the pane was created (or '' if unset)
 }
 
 const PANE_FMT = [
@@ -55,6 +56,7 @@ const PANE_FMT = [
   '#{pane_current_command}',
   '#{pane_current_path}',
   '#{pane_dead}',
+  '#{@orc_born}',
 ].join('\t');
 
 export function listPanes(): PaneInfo[] {
@@ -63,8 +65,8 @@ export function listPanes(): PaneInfo[] {
   const out: PaneInfo[] = [];
   for (const line of r.stdout.split('\n')) {
     if (!line) continue;
-    const [session, windowId, paneId, tag, cmd, cwd, dead] = line.split('\t');
-    out.push({ session, windowId, paneId, tag: tag ?? '', cmd, cwd, dead: dead === '1' });
+    const [session, windowId, paneId, tag, cmd, cwd, dead, born] = line.split('\t');
+    out.push({ session, windowId, paneId, tag: tag ?? '', cmd, cwd, dead: dead === '1', born: born ?? '' });
   }
   return out;
 }
@@ -213,6 +215,7 @@ export interface LiveSession {
   label: string;
   cwd: string;
   status: Status;
+  born: number; // ms timestamp the pane was created (0 if pre-dates this field)
 }
 
 function parseSessionTag(tag: string): { resumeId: string; label: string } | null {
@@ -237,6 +240,7 @@ export function liveSessions(): LiveSession[] {
       label: parsed.label,
       cwd: p.cwd,
       status: statusOfPane(p),
+      born: Number(p.born) || 0,
     });
   }
   return out;
@@ -272,5 +276,8 @@ export function createSession(opts: CreateOpts): PaneInfo | null {
 
   const tag = `${SESSION_TAG_PREFIX}${opts.resumeId ?? 'new'}|${opts.label}`;
   setPaneTag(pane.paneId, tag);
-  return { ...pane, tag };
+  // Birth timestamp: lets the UI tell a brand-new session's own transcript
+  // (written once the user sends a message) from pre-existing ones in the cwd.
+  setPaneOption(pane.paneId, '@orc_born', String(Date.now()));
+  return { ...pane, tag, born: String(Date.now()) };
 }

@@ -113,49 +113,182 @@ function placeholder() {
 // ===========================================================================
 // Dashboard UI (runs in the left pane)
 // ===========================================================================
-type RowStatus = tmux.Status | 'idle';
+// 'external' = a transcript being written by a claude process OUTSIDE orc
+// (another terminal/IDE) — live elsewhere, unsafe to resume in place.
+type RowStatus = tmux.Status | 'idle' | 'external';
 
 interface Row {
   key: string;
   title: string;
   cwd: string;
   status: RowStatus;
+  /** sort key: transcript mtime (ms). Brand-new sessions with no transcript
+   *  yet fall back to "now" so they surface at the top. */
+  mtime: number;
   live?: tmux.LiveSession;
   historical?: Session;
 }
 
-const STATUS_ORDER: Record<RowStatus, number> = { running: 0, ready: 1, dead: 2, idle: 3 };
+// Detect a transcript being driven by a claude OUTSIDE orc (another terminal),
+// so it's flagged "live elsewhere" instead of masquerading as a dormant idle
+// row. Two complementary signals, because the transcript is written in bursts
+// (one write at turn start, one flush at turn end) and stays static mid-stream:
+//   - mtime advanced since the last poll → a fresh write (turn boundary or a
+//     tool burst). A short grace keeps it flagged across sub-poll gaps.
+//   - awaiting a reply (last turn is an unanswered user message) AND written
+//     recently → covers the long silent stretch while a response generates.
+//     The recency gate is essential: ~13% of dormant sessions end on a bare
+//     user turn (measured), and without it they'd false-flag forever.
+const ACTIVE_GRACE_MS = 6000;
+const BUSY_WINDOW_MS = 60_000;
+const lastMtime = new Map<string, number>();
+const hotUntil = new Map<string, number>();
+
+function isActiveElsewhere(id: string, mtimeMs: number, awaitingReply: boolean): boolean {
+  const prev = lastMtime.get(id);
+  lastMtime.set(id, mtimeMs);
+  if (prev !== undefined && mtimeMs > prev) hotUntil.set(id, Date.now() + ACTIVE_GRACE_MS);
+  const advancing = (hotUntil.get(id) ?? 0) > Date.now();
+  const midTurn = awaitingReply && Date.now() - mtimeMs < BUSY_WINDOW_MS;
+  return advancing || midTurn;
+}
 
 function buildRows(): Row[] {
   const live = tmux.liveSessions();
-  const liveByResume = new Map(live.map((l) => [l.resumeId, l]));
-  const history = scanSessions();
+  const history = scanSessions(); // newest mtime first
   const names = loadNames();
+
+  // Transcript ids already represented by a live row — so they don't also show
+  // up as a duplicate idle row below.
+  const claimed = new Set<string>();
+  // Reserve resumed sessions' transcripts up front, so a brand-new session in
+  // the same cwd can't accidentally claim one of them.
+  for (const l of live) {
+    if (l.resumeId !== 'new') {
+      const h = history.find((x) => x.id === l.resumeId);
+      if (h) claimed.add(h.id);
+    }
+  }
 
   const rows: Row[] = [];
   for (const l of live) {
-    const h = history.find((x) => x.id === l.resumeId);
+    if (l.resumeId !== 'new') {
+      const h = history.find((x) => x.id === l.resumeId);
+      rows.push({
+        key: l.paneId,
+        title: names[l.resumeId] ?? h?.title ?? l.label ?? '(new session)',
+        cwd: l.cwd,
+        status: l.status,
+        mtime: h?.mtimeMs ?? Date.now(),
+        live: l,
+        historical: h,
+      });
+      continue;
+    }
+    // Brand-new session: no resume id yet. Don't borrow a pre-existing
+    // transcript's identity — only adopt one this pane created itself, i.e. a
+    // transcript in the same cwd touched at/after the pane was born (which
+    // happens once the user sends a first message). Until then it's just
+    // "new session". `born === 0` (sessions created before this field existed)
+    // falls back to the old freshest-in-cwd behaviour.
+    const h = history.find(
+      (x) => x.cwd === l.cwd && !claimed.has(x.id) && x.mtimeMs >= l.born,
+    );
+    if (h) {
+      claimed.add(h.id);
+      // Pin the identity to the real transcript id so subsequent polls take the
+      // stable resumeId path and this binding can never flip again.
+      const pinned = (names[h.id] ?? h.title).slice(0, 40);
+      tmux.setPaneTag(l.paneId, `s|${h.id}|${pinned}`);
+    }
+    const title =
+      (h && names[h.id]) ||
+      (h && h.title && h.title !== '(untitled)' ? shortLabel(h.title) : 'new session');
     rows.push({
       key: l.paneId,
-      title: names[l.resumeId] ?? h?.title ?? l.label ?? '(new session)',
+      title,
       cwd: l.cwd,
       status: l.status,
+      mtime: h?.mtimeMs ?? Date.now(),
       live: l,
       historical: h,
     });
   }
   for (const h of history) {
-    if (liveByResume.has(h.id)) continue;
-    rows.push({ key: h.id, title: names[h.id] ?? h.title, cwd: h.cwd, status: 'idle', historical: h });
+    if (claimed.has(h.id)) continue;
+    rows.push({
+      key: h.id,
+      title: names[h.id] ?? h.title,
+      cwd: h.cwd,
+      // Unowned but being written by a claude outside orc → not safe to resume.
+      status: isActiveElsewhere(h.id, h.mtimeMs, h.awaitingReply) ? 'external' : 'idle',
+      mtime: h.mtimeMs,
+      historical: h,
+    });
   }
 
-  rows.sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status]);
+  // Most-recently-touched first. A running session bumps its own transcript
+  // mtime as Claude writes to it, so active work naturally floats to the top.
+  rows.sort((a, b) => b.mtime - a.mtime);
   return rows;
 }
 
 function shortPath(p: string): string {
   if (!p) return '';
   return p.startsWith(HOME) ? '~' + p.slice(HOME.length) : p;
+}
+
+// Condense a first-prompt into a short, label-like name for the sidebar.
+function shortLabel(s: string): string {
+  const clean = (s || '').replace(/\s+/g, ' ').trim();
+  if (clean.length <= 40) return clean;
+  const slice = clean.slice(0, 40);
+  const sp = slice.lastIndexOf(' ');
+  return (sp >= 20 ? slice.slice(0, sp) : slice).trim();
+}
+
+// Keys shown in the `?` overlay. Kept here so the help and the bindings in
+// useInput stay in one place.
+const SHORTCUTS: [string, string][] = [
+  ['↑↓ / j k', 'move up and down'],
+  ['Enter', 'open (starts idle sessions) + focus'],
+  ['Tab', 'jump focus into the session'],
+  ['n', 'name / rename the highlighted chat'],
+  ['N', 'new session'],
+  ['x', 'kill the highlighted session'],
+  ['[  ]', 'shrink / grow the sidebar'],
+  ['/', 'filter the list'],
+  ['r', 'refresh now'],
+  ['d', 'detach — leave sessions running'],
+  ['q / Ctrl-C', 'quit orc + tear everything down'],
+  ['Alt-← / →', 'move focus: list ⇄ session'],
+  ['?', 'toggle this help  ·  Esc closes'],
+];
+
+function HelpOverlay({ width }: { width: number }) {
+  const keyW = Math.max(...SHORTCUTS.map(([k]) => k.length));
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="cyan"
+      paddingX={1}
+      marginTop={1}
+      width={width}
+    >
+      <Box marginBottom={1}>
+        <Text bold color="cyan">
+          shortcuts
+        </Text>
+      </Box>
+      {SHORTCUTS.map(([k, desc]) => (
+        <Box key={k}>
+          <Text color="yellow">{k.padEnd(keyW)}</Text>
+          <Text dimColor>{'  ' + desc}</Text>
+        </Box>
+      ))}
+    </Box>
+  );
 }
 
 // Truncate to width, breaking on a word boundary when one is reasonably close,
@@ -182,6 +315,12 @@ function StatusGlyph({ status }: { status: RowStatus }) {
       </Text>
     );
   if (status === 'dead') return <Text color="red">✗</Text>;
+  if (status === 'external')
+    return (
+      <Text color="yellow" bold>
+        ●
+      </Text>
+    );
   return <Text color="gray">✓</Text>;
 }
 
@@ -217,11 +356,15 @@ function Dashboard() {
 
   const [stagePaneId, setStagePaneId] = useState(initialStage?.paneId ?? '');
   const [rows, setRows] = useState<Row[]>([]);
-  const [index, setIndex] = useState(0);
+  // Selection follows a session's stable identity (pane id for live rows,
+  // transcript id for idle rows), NOT its slot — so the list can re-sort under
+  // the cursor without the highlight drifting onto a different session.
+  const [selectedKey, setSelectedKey] = useState('');
   const [query, setQuery] = useState('');
   const [typing, setTyping] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState('');
+  const [help, setHelp] = useState(false);
 
   const refresh = useCallback(() => setRows(buildRows()), []);
 
@@ -234,7 +377,10 @@ function Dashboard() {
   const filtered = query
     ? rows.filter((r) => (r.title + ' ' + r.cwd).toLowerCase().includes(query.toLowerCase()))
     : rows;
-  const clamped = Math.max(0, Math.min(index, filtered.length - 1));
+  // Re-derive the cursor position from the selected identity every render. If
+  // the selected row vanished (killed, or filtered out) fall back to the top.
+  const sel = filtered.findIndex((r) => r.key === selectedKey);
+  const clamped = sel >= 0 ? sel : 0;
   const selected = filtered[clamped];
 
   const showOnStage = useCallback(
@@ -253,6 +399,7 @@ function Dashboard() {
     (row: Row | undefined) => {
       if (!row) return;
       if (row.live) {
+        setSelectedKey(row.live.paneId);
         showOnStage(row.live.paneId);
         return;
       }
@@ -262,7 +409,10 @@ function Dashboard() {
           label: row.historical.title.slice(0, 40),
           cwd: row.historical.cwd,
         });
-        if (pane) showOnStage(pane.paneId);
+        if (pane) {
+          setSelectedKey(pane.paneId);
+          showOnStage(pane.paneId);
+        }
         refresh();
       }
     },
@@ -272,7 +422,10 @@ function Dashboard() {
   const newSession = useCallback(() => {
     const cwd = selected?.cwd && selected.cwd !== '~' ? selected.cwd : HOME;
     const pane = tmux.createSession({ resumeId: 'new', label: 'new session', cwd });
-    if (pane) showOnStage(pane.paneId);
+    if (pane) {
+      setSelectedKey(pane.paneId);
+      showOnStage(pane.paneId);
+    }
     refresh();
   }, [selected, showOnStage, refresh]);
 
@@ -330,19 +483,27 @@ function Dashboard() {
       else if (input && !key.ctrl && !key.meta) setQuery((q) => q + input);
       return;
     }
-
-    if (key.ctrl && input === 'c') {
+    // help overlay swallows everything; esc / ? / q close it
+    if (help) {
+      if (key.escape || input === '?' || input === 'q') setHelp(false);
+      return;
+    }
+    if (input === '?') {
+      setHelp(true);
+    } else if (key.ctrl && input === 'c') {
       tmux.killServer(); // Ctrl-C → quit orc back to a clean terminal
     } else if (input === 'q') {
       tmux.killServer(); // quit orc + tear down all hosted sessions (kills this process too)
     } else if (input === 'd') {
       tmux.detachClient(); // detach only — UI keeps running so reattach is instant
     } else if (key.upArrow || input === 'k') {
-      setIndex((i) => Math.max(0, Math.min(i, filtered.length - 1) - 1));
+      setSelectedKey(filtered[Math.max(0, clamped - 1)]?.key ?? selectedKey);
     } else if (key.downArrow || input === 'j') {
-      setIndex((i) => Math.min(filtered.length - 1, i + 1));
+      setSelectedKey(filtered[Math.min(filtered.length - 1, clamped + 1)]?.key ?? selectedKey);
     } else if (key.return) {
-      openRow(selected);
+      // A session being written elsewhere can't be safely resumed in place —
+      // it's not openable; wait for it to go idle. Dormant rows open normally.
+      if (selected?.status !== 'external') openRow(selected);
     } else if (key.tab) {
       tmux.selectPane(stagePaneId); // focus the session without changing selection
     } else if (input === 'n') {
@@ -389,10 +550,14 @@ function Dashboard() {
             filter: <Text color="yellow">{query}</Text>▏
           </Text>
         ) : (
-          <Text dimColor wrap="truncate">↑↓ enter · n name · N new · x · [ ]size · / · q · d</Text>
+          <Text dimColor wrap="truncate">↑↓ enter · n name · N new · x · / · ? help · q · d</Text>
         )}
       </Box>
 
+      {help && <HelpOverlay width={dims.cols} />}
+
+      {!help && (
+      <>
       <Box flexDirection="column" marginTop={1}>
         {filtered.length === 0 && <Text dimColor>no sessions</Text>}
         {view.map((r, i) => {
@@ -423,7 +588,14 @@ function Dashboard() {
           <Text dimColor wrap="truncate">
             {shortPath(selected.cwd)}
           </Text>
+          {selected.status === 'external' && (
+            <Text color="yellow" wrap="truncate">
+              ● active in another window — wait for it to go idle to resume
+            </Text>
+          )}
         </Box>
+      )}
+      </>
       )}
     </Box>
   );

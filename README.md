@@ -24,13 +24,18 @@ tmux (on its own isolated socket — your normal tmux is untouched).
 | `▶` (green) | **ready for input** | live and waiting on you |
 | `✗` (red) | **dead** | claude exited — select + Enter to restart |
 | `✓` (grey) | **idle** | a past session, not running — Enter starts it in the background |
+| `●` (yellow) | **active elsewhere** | a session being driven by a claude *outside* orc (another terminal/IDE) — not openable; wait for it to go idle, then resume it here |
 
 ## Keys (in the left list)
 
 `↑↓`/`jk` move · `Enter` open (starts idle ones) → stage + focus · `Tab` focus
 the session · `n` **name/rename** the highlighted chat · `N` new session · `x`
 kill · `[` / `]` shrink/grow the sidebar (persists across resizes) · `/` filter ·
-`r` refresh.
+`r` refresh · `?` **help** (a floating shortcut cheatsheet; `Esc` closes).
+
+A brand-new session (`N`) is labelled `new session` only until you send your
+first message — then it auto-renames to a short name derived from that prompt.
+Press `n` any time to override it with your own name.
 
 **Renaming** (`n`): type the new name and `Enter` (empty = cancel, `Ctrl-U`
 clears). Names are saved to `~/.config/orc/names.json`, keyed by the session's
