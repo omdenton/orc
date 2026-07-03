@@ -20,6 +20,11 @@ export interface Session {
   messageCount: number;
   /** file mtime in ms — drives freshness + "running" detection */
   mtimeMs: number;
+  /** ms timestamp of the last *conversational* record (user/assistant turn).
+   *  Unlike file mtime this ignores metadata-only writes — `--resume` on open,
+   *  permission-mode / ai-title / last-prompt sidecar records — so it reflects
+   *  "last time I messaged or claude was active", which is the sidebar order. */
+  lastActivityMs: number;
   /** type of the final transcript record */
   lastType: string;
   /** true when the last *conversational* record is a user turn with no
@@ -72,6 +77,7 @@ function parseFile(path: string, mtimeMs: number): Session {
   let lastType = '';
   let lastRole = ''; // role of the last user/assistant record (ignores metadata lines)
   let firstUserText = '';
+  let lastActivityMs = 0; // newest conversational-record timestamp
 
   let text = '';
   try {
@@ -89,7 +95,16 @@ function parseFile(path: string, mtimeMs: number): Session {
       continue;
     }
     if (r.type) lastType = r.type;
-    if (r.type === 'user' || r.type === 'assistant') lastRole = r.type;
+    if (r.type === 'user' || r.type === 'assistant') {
+      lastRole = r.type;
+      // Track the newest turn timestamp. Sub-agent (sidechain) turns count too —
+      // they mean the session is actively working. Metadata records carry no
+      // timestamp and so never bump this.
+      if (typeof r.timestamp === 'string') {
+        const t = Date.parse(r.timestamp);
+        if (t > lastActivityMs) lastActivityMs = t;
+      }
+    }
     if (!cwd && typeof r.cwd === 'string') cwd = r.cwd;
     if (typeof r.gitBranch === 'string') gitBranch = r.gitBranch;
     if (typeof r.messageCount === 'number' && r.messageCount > messageCount) {
@@ -119,6 +134,7 @@ function parseFile(path: string, mtimeMs: number): Session {
     permissionMode,
     messageCount,
     mtimeMs,
+    lastActivityMs: lastActivityMs || mtimeMs,
     lastType,
     awaitingReply: lastRole === 'user',
   };

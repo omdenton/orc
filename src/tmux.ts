@@ -3,8 +3,12 @@ import { spawnSync } from 'node:child_process';
 /**
  * All orc tmux state lives on a dedicated socket so it never collides with the
  * user's normal tmux server, and we can set root key-bindings freely.
+ *
+ * Overridable via $ORC_SOCKET so destructive tooling (stage-test, which calls
+ * kill-server) can run on a throwaway socket and NEVER touch a live `orc`
+ * dashboard + its hosted sessions. Production always uses the default 'orc'.
  */
-export const SOCKET = 'orc';
+export const SOCKET = process.env.ORC_SOCKET || 'orc';
 export const DASH_SESSION = 'orc';
 export const SESSION_PREFIX = 'orc-';
 
@@ -154,6 +158,16 @@ export function bindRootKey(key: string, ...cmd: string[]): void {
   tmux(['bind-key', '-n', key, ...cmd]);
 }
 
+/** Remove a root-table binding (e.g. one leaked in from the user's tmux.conf). */
+export function unbindRootKey(key: string): void {
+  tmux(['unbind-key', '-n', key]);
+}
+
+/** Bind a key/event within a specific tmux key table (e.g. 'copy-mode-vi'). */
+export function bindKeyInTable(table: string, key: string, ...cmd: string[]): void {
+  tmux(['bind-key', '-T', table, key, ...cmd]);
+}
+
 export function setGlobalOption(opt: string, val: string): void {
   tmux(['set-option', '-g', opt, val]);
 }
@@ -187,15 +201,43 @@ export function attachBlocking(): number {
 
 export type Status = 'running' | 'ready' | 'dead';
 
-// Claude's active-turn footer. Tunable — verify against a real working session.
-const WORKING_MARKERS = [/esc to interrupt/i, /\(esc\b/i];
+// Claude's live-status indicator only ever lives in the BOTTOM CHROME — the
+// `⏵⏵ … esc to interrupt …` mode line, and the dim status slot just above the
+// input box. It is NEVER in the scrollback. We must scope the scan to the last
+// few lines: the same phrases ("esc to interrupt", "… to finish") routinely
+// appear in the *conversation itself* (a chat about Claude's own UI is the
+// cautionary example), and a whole-pane scan matches that prose and pins the
+// session to "running" forever. Verify these against a real session if status
+// starts misreporting — they're coupled to Claude Code's wording.
+
+// The interruptible-turn hint, shown in the bottom `⏵⏵` mode line only while a
+// turn is actively working: "… (shift+tab to cycle) · esc to interrupt · …".
+// Absent when idle. Scanned in the bottom few lines (chrome), never the body.
+const WORKING_MODE_LINE = /\besc to interrupt\b/i;
+// The background-wait status line: shown when the main turn has ENDED but a
+// dynamic workflow / background agents (ultracode) are still running — there is
+// no "esc to interrupt" then. Real form: "✻ Waiting for 1 dynamic workflow to
+// finish". Anchored to a whole line — leading spinner glyph + spaces allowed,
+// then it must START with "Waiting for N" and END with "to finish" — so the
+// phrase embedded in a transcript sentence ("…the 'Waiting for … to finish'
+// footer…") can't trigger it (that line starts with other words).
+const BG_WAIT_FOOTER = /^[^\w\n]*waiting for \d+\b.*\bto finish[^\S\n]*$/im;
 // Commands that mean "claude is still the foreground process in this pane".
 const CLAUDE_CMDS = new Set(['claude', 'node', 'bun', 'deno']);
+
+/** Last `n` lines of `text` (trailing blanks trimmed first), as one string. */
+function tailLines(text: string, n: number): string {
+  const lines = text.replace(/\s+$/, '').split('\n');
+  return lines.slice(Math.max(0, lines.length - n)).join('\n');
+}
 
 /** Pure classifier — `cmd` is the pane's foreground command, `text` its screen. */
 export function classifyCapture(cmd: string, text: string): Status {
   if (!CLAUDE_CMDS.has(cmd)) return 'dead'; // dropped back to a shell
-  if (WORKING_MARKERS.some((re) => re.test(text))) return 'running';
+  // Mode line sits in the last ~5 lines (input box + mode/context chrome).
+  if (WORKING_MODE_LINE.test(tailLines(text, 5))) return 'running';
+  // The bg-wait status slot sits just above the input box; allow more headroom.
+  if (BG_WAIT_FOOTER.test(tailLines(text, 10))) return 'running';
   return 'ready';
 }
 

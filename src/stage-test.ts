@@ -13,6 +13,18 @@ import {
   classifyCapture,
 } from './tmux.js';
 
+// HARD SAFETY GUARD. This test calls `kill-server`, which tears down the entire
+// tmux server on SOCKET — including a live orc dashboard and every session it
+// hosts. Refuse to run unless pointed at a throwaway socket via $ORC_SOCKET, so
+// it can never nuke the user's real `orc`. `npm run stagetest` sets this.
+if (SOCKET === 'orc') {
+  console.error(
+    'stage-test is destructive (kill-server) and refuses to run on the live "orc" socket.\n' +
+      'Run it via `npm run stagetest` (which sets ORC_SOCKET=orc-test), or set ORC_SOCKET yourself.',
+  );
+  process.exit(1);
+}
+
 function raw(args: string[]) {
   return spawnSync('tmux', ['-L', SOCKET, ...args], { encoding: 'utf8' });
 }
@@ -87,9 +99,33 @@ check('two live sessions tracked', sessions.length === 2);
 check('labels recovered from tags', sessions.some((s) => s.label === 'Session A') && sessions.some((s) => s.label === 'Session B'));
 
 console.log('status classifier:');
-check("working footer -> running", classifyCapture('node', 'foo\n  ✻ Working… (esc to interrupt)\n') === 'running');
-check('quiet claude -> ready', classifyCapture('claude', '│ > \n  ? for shortcuts') === 'ready');
+// Real bottom-chrome captures (the live status lives only in the last few lines).
+const MODE_WORKING = '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents';
+const MODE_IDLE = '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents';
+const inputBox = `${'─'.repeat(80)}\n❯ \n${'─'.repeat(80)}`;
+const workingScreen = `✢ Elucidating… (7m 22s · ↓ 14.8k tokens)\n\n${inputBox}\n${MODE_WORKING}`;
+const idleScreen = `✻ Crunched for 16m 19s\n\n${inputBox}\n${MODE_IDLE}\n  ⧉  some · context`;
+// Real footer carries a leading spinner glyph; the workflow progress line and
+// context line sit below the mode line.
+const bgWaitScreen = `✻ Waiting for 1 dynamic workflow to finish\n\n${inputBox}\n${MODE_IDLE}\n  ◯ sfp-extra  0/12 agents done · 2m 42s\n  ⧉  a · b`;
+
+check('working mode line -> running', classifyCapture('node', workingScreen) === 'running');
+check('idle mode line -> ready', classifyCapture('claude', idleScreen) === 'ready');
+check('bg dynamic-workflow wait -> running', classifyCapture('node', bgWaitScreen) === 'running');
+check(
+  'bg agents+workflow wait -> running',
+  classifyCapture('node', `✻ Waiting for 2 background agents and 1 dynamic workflow to finish\n\n${inputBox}\n${MODE_IDLE}\n  ⧉  a · b`) === 'running',
+);
 check('shell command -> dead', classifyCapture('zsh', 'denton@host $ ') === 'dead');
+
+// Regression: the markers appearing in the CONVERSATION body must NOT trip the
+// classifier. A chat *about* orc's own status detection is full of these phrases
+// (this very session was). Only the bottom chrome counts, and it's idle here.
+const metaChatIdle =
+  'You said it shows "esc to interrupt" and "Waiting for 1 dynamic workflow to finish".\n' +
+  'I hardened the markers (dynamic workflow to finish / background agents to finish).\n' +
+  `${'─'.repeat(80)}\n❯ \n${'─'.repeat(80)}\n${MODE_IDLE}\n  ⧉  orc · context`;
+check('marker phrases in transcript body -> still ready', classifyCapture('claude', metaChatIdle) === 'ready');
 
 raw(['kill-server']);
 console.log(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);

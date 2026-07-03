@@ -51,10 +51,25 @@ function createDashboard() {
   tmux.setGlobalOption('status', 'off');
   tmux.setGlobalOption('mouse', 'on');
   tmux.setGlobalOption('pane-border-status', 'off');
+  // Mouse mode (above) lets you drag the pane divider, but it also makes tmux
+  // swallow drag-selections into copy mode — they'd just vanish on release.
+  // So: pipe a mouse-drag selection straight to the Wayland clipboard and exit
+  // copy mode, so a plain drag actually copies. (Shift+drag still bypasses tmux
+  // entirely for native Alacritty selection / link-clicking.) set-clipboard on
+  // also lets the hosted claude sessions write your clipboard via OSC52.
+  tmux.setGlobalOption('set-clipboard', 'on');
+  tmux.bindKeyInTable('copy-mode-vi', 'MouseDragEnd1Pane', 'send-keys', '-X', 'copy-pipe-and-cancel', 'wl-copy');
+  tmux.bindKeyInTable('copy-mode', 'MouseDragEnd1Pane', 'send-keys', '-X', 'copy-pipe-and-cancel', 'wl-copy');
   tmux.bindRootKey('M-h', 'select-pane', '-L');
   tmux.bindRootKey('M-l', 'select-pane', '-R');
   tmux.bindRootKey('M-Left', 'select-pane', '-L');
   tmux.bindRootKey('M-Right', 'select-pane', '-R');
+  // orc inherits the user's ~/.tmux.conf, which may bind Alt-Up/Down (e.g. to
+  // switch-client) — easy to hit by accident while picking a row, and it yanks
+  // the client off the dashboard. This layout is two side-by-side panes, so
+  // vertical pane moves are meaningless; drop them so they're inert.
+  tmux.unbindRootKey('M-Up');
+  tmux.unbindRootKey('M-Down');
 
   tmux.selectPane(left.paneId);
 }
@@ -129,12 +144,13 @@ interface Row {
   historical?: Session;
 }
 
-// Detect a transcript being driven by a claude OUTSIDE orc (another terminal),
-// so it's flagged "live elsewhere" instead of masquerading as a dormant idle
-// row. Two complementary signals, because the transcript is written in bursts
-// (one write at turn start, one flush at turn end) and stays static mid-stream:
+// Is this transcript's claude actively in a turn right now? Content-PROOF: it
+// reads the .jsonl, never the screen, so a chat that merely *talks about* "esc
+// to interrupt" / "to finish" can't fool it. Two complementary signals, because
+// the transcript is written in bursts (one write at turn start, one flush at
+// turn end) and stays static mid-stream:
 //   - mtime advanced since the last poll → a fresh write (turn boundary or a
-//     tool burst). A short grace keeps it flagged across sub-poll gaps.
+//     tool/sub-agent burst). A short grace keeps it flagged across poll gaps.
 //   - awaiting a reply (last turn is an unanswered user message) AND written
 //     recently → covers the long silent stretch while a response generates.
 //     The recency gate is essential: ~13% of dormant sessions end on a bare
@@ -144,13 +160,24 @@ const BUSY_WINDOW_MS = 60_000;
 const lastMtime = new Map<string, number>();
 const hotUntil = new Map<string, number>();
 
-function isActiveElsewhere(id: string, mtimeMs: number, awaitingReply: boolean): boolean {
+function transcriptBusy(id: string, mtimeMs: number, awaitingReply: boolean): boolean {
   const prev = lastMtime.get(id);
   lastMtime.set(id, mtimeMs);
   if (prev !== undefined && mtimeMs > prev) hotUntil.set(id, Date.now() + ACTIVE_GRACE_MS);
   const advancing = (hotUntil.get(id) ?? 0) > Date.now();
   const midTurn = awaitingReply && Date.now() - mtimeMs < BUSY_WINDOW_MS;
   return advancing || midTurn;
+}
+
+// A hosted session's effective status. The transcript is the content-proof
+// signal that a turn is in flight (active generation, tool calls, sub-agents);
+// the screen capture (classifyCapture) is the only thing that can see the
+// background-workflow *wait*, where the main transcript goes quiet. Either ⇒
+// running. We never DOWNgrade a capture "running" — a dead read still wins.
+function liveStatus(captureStatus: tmux.Status, h?: Session): tmux.Status {
+  if (captureStatus === 'dead') return 'dead';
+  if (h && transcriptBusy(h.id, h.mtimeMs, h.awaitingReply)) return 'running';
+  return captureStatus;
 }
 
 function buildRows(): Row[] {
@@ -178,8 +205,8 @@ function buildRows(): Row[] {
         key: l.paneId,
         title: names[l.resumeId] ?? h?.title ?? l.label ?? '(new session)',
         cwd: l.cwd,
-        status: l.status,
-        mtime: h?.mtimeMs ?? Date.now(),
+        status: liveStatus(l.status, h),
+        mtime: h?.lastActivityMs ?? Date.now(),
         live: l,
         historical: h,
       });
@@ -208,8 +235,8 @@ function buildRows(): Row[] {
       key: l.paneId,
       title,
       cwd: l.cwd,
-      status: l.status,
-      mtime: h?.mtimeMs ?? Date.now(),
+      status: liveStatus(l.status, h),
+      mtime: h?.lastActivityMs ?? Date.now(),
       live: l,
       historical: h,
     });
@@ -221,14 +248,17 @@ function buildRows(): Row[] {
       title: names[h.id] ?? h.title,
       cwd: h.cwd,
       // Unowned but being written by a claude outside orc → not safe to resume.
-      status: isActiveElsewhere(h.id, h.mtimeMs, h.awaitingReply) ? 'external' : 'idle',
-      mtime: h.mtimeMs,
+      status: transcriptBusy(h.id, h.mtimeMs, h.awaitingReply) ? 'external' : 'idle',
+      mtime: h.lastActivityMs,
       historical: h,
     });
   }
 
-  // Most-recently-touched first. A running session bumps its own transcript
-  // mtime as Claude writes to it, so active work naturally floats to the top.
+  // Most-recently-active first, by last conversational turn (last message I sent
+  // or last assistant/sub-agent activity) — NOT raw file mtime, which a bare
+  // `--resume` on open would bump, floating a just-opened-but-untouched session
+  // above one I actually messaged more recently. Brand-new sessions sort by
+  // Date.now() (set above) so they surface at the top until their first turn.
   rows.sort((a, b) => b.mtime - a.mtime);
   return rows;
 }
@@ -533,8 +563,13 @@ function Dashboard() {
   );
   const view = filtered.slice(start, start + visibleRows);
 
+  // height is rows-1, not rows: a full-height frame makes Ink's trailing
+  // newline overflow the pane, defeating its differential renderer and forcing
+  // a full clear+repaint every frame — which the running-session spinner
+  // (~80ms) then turns into constant flicker. One row of headroom keeps Ink in
+  // diff mode so only changed cells repaint.
   return (
-    <Box flexDirection="column" width={dims.cols} height={dims.rows} overflow="hidden">
+    <Box flexDirection="column" width={dims.cols} height={dims.rows - 1} overflow="hidden">
       <Box width={dims.cols}>
         <Text bold>orc</Text>
         <Text dimColor> · {liveCount} live / {rows.length}</Text>
