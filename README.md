@@ -57,7 +57,8 @@ Forward: `Alt-→` / `Alt-l`. Native tmux `Ctrl-b ←/→`, and `Ctrl-b z` to zo
 session fullscreen, also work.
 
 Every session runs `claude --resume <id> --dangerously-skip-permissions` in its
-own directory. `q` just detaches; re-run `orc` to reattach — sessions persist.
+own directory. If claude exits, the pane is kept and the row turns `✗` — press
+Enter to restart it in place.
 
 ## Recovery
 

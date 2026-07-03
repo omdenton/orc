@@ -1,4 +1,6 @@
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 
 /**
  * All orc tmux state lives on a dedicated socket so it never collides with the
@@ -102,9 +104,11 @@ export function selfWindowId(): string {
 // Pane operations
 // ---------------------------------------------------------------------------
 
-/** Tag a pane with our identity option (survives Claude renaming the title). */
+/** Tag a pane with our identity option (survives Claude renaming the title).
+ *  Tags travel through tab-separated list-panes output, so strip separators —
+ *  an aiTitle with a tab/newline would shift every field after it. */
 export function setPaneTag(paneId: string, tag: string): void {
-  tmux(['set-option', '-p', '-t', paneId, '@orc', tag]);
+  tmux(['set-option', '-p', '-t', paneId, '@orc', tag.replace(/[\t\n\r]+/g, ' ')]);
 }
 
 export function setPaneOption(paneId: string, opt: string, val: string): void {
@@ -257,6 +261,10 @@ export function classifyCapture(cmd: string, text: string): Status {
 }
 
 export function statusOfPane(pane: PaneInfo): Status {
+  // A remain-on-exit corpse: claude exited but the pane was kept so the
+  // session can be restarted in place (Enter). The capture still shows
+  // claude's final screen, so check the flag before classifying.
+  if (pane.dead) return 'dead';
   return classifyCapture(pane.cmd, capturePane(pane.paneId));
 }
 
@@ -303,8 +311,14 @@ export function liveSessions(): LiveSession[] {
   return out;
 }
 
-function shellQuote(s: string): string {
+export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+function claudeCmd(resumeId?: string): string {
+  const argv = ['claude', '--dangerously-skip-permissions'];
+  if (resumeId && resumeId !== 'new') argv.push('--resume', resumeId);
+  return argv.map(shellQuote).join(' ');
 }
 
 let counter = 0;
@@ -321,11 +335,11 @@ export interface CreateOpts {
  */
 export function createSession(opts: CreateOpts): PaneInfo | null {
   const name = `${SESSION_PREFIX}${Date.now().toString(36)}${(counter++).toString(36)}`;
-  const argv = ['claude', '--dangerously-skip-permissions'];
-  if (opts.resumeId && opts.resumeId !== 'new') argv.push('--resume', opts.resumeId);
-  const cmd = argv.map(shellQuote).join(' ');
+  // Old transcripts can point at since-deleted directories; tmux refuses
+  // `new-session -c <missing>` and the open would silently no-op.
+  const cwd = existsSync(opts.cwd) ? opts.cwd : homedir();
 
-  const r = tmux(['new-session', '-d', '-s', name, '-c', opts.cwd, cmd]);
+  const r = tmux(['new-session', '-d', '-s', name, '-c', cwd, claudeCmd(opts.resumeId)]);
   if (r.code !== 0) return null;
 
   const pane = listPanes().find((p) => p.session === name);
@@ -336,5 +350,15 @@ export function createSession(opts: CreateOpts): PaneInfo | null {
   // Birth timestamp: lets the UI tell a brand-new session's own transcript
   // (written once the user sends a message) from pre-existing ones in the cwd.
   setPaneOption(pane.paneId, '@orc_born', String(Date.now()));
+  // Keep the pane when claude exits, so the session shows as dead (✗) and can
+  // be restarted in place with Enter — instead of vanishing (and collapsing
+  // the dashboard window if it was on stage).
+  setPaneOption(pane.paneId, 'remain-on-exit', 'on');
   return { ...pane, tag, born: String(Date.now()) };
+}
+
+/** Restart claude in a dead session pane (remain-on-exit corpse), in place. */
+export function respawnSession(paneId: string, resumeId: string | undefined, cwd: string): void {
+  const dir = existsSync(cwd) ? cwd : homedir();
+  tmux(['respawn-pane', '-k', '-c', dir, '-t', paneId, claudeCmd(resumeId)]);
 }

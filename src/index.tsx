@@ -12,7 +12,7 @@ const HOME = homedir();
 const POLL_MS = 1500;
 const LEFT_COLS = 46;
 
-const paneCmd = (sub: string) => `${NODE} ${ORC_BIN} ${sub}`;
+const paneCmd = (sub: string) => `${tmux.shellQuote(NODE)} ${tmux.shellQuote(ORC_BIN)} ${sub}`;
 
 // ===========================================================================
 // Bootstrap: create the dashboard tmux session (left = orc UI, right = stage),
@@ -224,7 +224,10 @@ function buildRows(): Row[] {
     if (l.resumeId !== 'new') {
       const h = history.find((x) => x.id === l.resumeId);
       rows.push({
-        key: l.paneId,
+        // Row identity keys off the transcript id, not the pane id: it stays
+        // the same across idle → live → idle transitions, so the selection
+        // (and a rename in progress) can't silently retarget another session.
+        key: l.resumeId,
         title: names[l.resumeId] ?? h?.title ?? l.label ?? '(new session)',
         cwd: l.cwd,
         status: liveStatus(l.status, h),
@@ -239,19 +242,31 @@ function buildRows(): Row[] {
     // transcript in the same cwd whose first turn happened at/after the pane
     // was born (which happens once the user sends a first message). Until then
     // it's just "new session". See canAdopt for why mtime alone isn't enough.
-    const h = history.find((x) => x.cwd === l.cwd && !claimed.has(x.id) && canAdopt(x, l.born));
+    // With TWO unadopted new panes in the same cwd the first-turn test can't
+    // tell whose transcript it is — adopting would pin the id onto whichever
+    // pane polls first, possibly the wrong one. Defer until it's unambiguous.
+    const rivals = live.filter((x) => x.resumeId === 'new' && x.cwd === l.cwd).length;
+    const h =
+      rivals === 1
+        ? history.find((x) => x.cwd === l.cwd && !claimed.has(x.id) && canAdopt(x, l.born))
+        : undefined;
+    // A rename of a not-yet-adopted session lives only in the tag label.
+    const customLabel = l.label && l.label !== 'new session' ? l.label : '';
     if (h) {
       claimed.add(h.id);
       // Pin the identity to the real transcript id so subsequent polls take the
-      // stable resumeId path and this binding can never flip again.
-      const pinned = (names[h.id] ?? h.title).slice(0, 40);
+      // stable resumeId path and this binding can never flip again. Keep a
+      // user-chosen label over the transcript's derived title.
+      const pinned = (names[h.id] ?? (customLabel || h.title)).slice(0, 40);
       tmux.setPaneTag(l.paneId, `s|${h.id}|${pinned}`);
     }
     const title =
       (h && names[h.id]) ||
-      (h && h.title && h.title !== '(untitled)' ? shortLabel(h.title) : 'new session');
+      customLabel ||
+      (h && h.title && h.title !== '(untitled)' ? shortLabel(h.title) : '') ||
+      'new session';
     rows.push({
-      key: l.paneId,
+      key: h?.id ?? l.paneId,
       title,
       cwd: l.cwd,
       status: liveStatus(l.status, h),
@@ -290,8 +305,9 @@ function shortPath(p: string): string {
 // Condense a first-prompt into a short, label-like name for the sidebar.
 function shortLabel(s: string): string {
   const clean = (s || '').replace(/\s+/g, ' ').trim();
-  if (clean.length <= 40) return clean;
-  const slice = clean.slice(0, 40);
+  const chars = Array.from(clean); // code points — don't bisect emoji
+  if (chars.length <= 40) return clean;
+  const slice = chars.slice(0, 40).join('');
   const sp = slice.lastIndexOf(' ');
   return (sp >= 20 ? slice.slice(0, sp) : slice).trim();
 }
@@ -341,10 +357,12 @@ function HelpOverlay({ width }: { width: number }) {
 }
 
 // Truncate to width, breaking on a word boundary when one is reasonably close,
-// then pad so the selection highlight fills the row.
+// then pad so the selection highlight fills the row. Slices by code point —
+// a .slice() through an emoji leaves a lone surrogate (renders as �).
 function pad(s: string, n: number): string {
-  if (s.length <= n) return s.padEnd(n);
-  const slice = s.slice(0, n - 1);
+  const chars = Array.from(s);
+  if (chars.length <= n) return s + ' '.repeat(n - chars.length);
+  const slice = chars.slice(0, n - 1).join('');
   const sp = slice.lastIndexOf(' ');
   const base = sp >= Math.floor(n * 0.6) ? slice.slice(0, sp) : slice;
   return (base + '…').padEnd(n);
@@ -377,13 +395,20 @@ function StatusGlyph({ status, spin }: { status: RowStatus; spin: string }) {
 }
 
 // Fixed (non-list) lines: header, hint, blank, then the detail block
-// (blank + up to 2 title lines + cwd), with a line of slack.
-const CHROME_LINES = 8;
+// (blank + up to 2 title lines + cwd + status line), plus the row of headroom
+// the rows-1 frame keeps for Ink. The status line is always reserved — it only
+// sometimes has content (the 'external' warning), but growing the block on
+// selection would overflow the frame and clip the warning exactly when it's
+// needed.
+const CHROME_LINES = 9;
 
 function Dashboard() {
   const { stdout } = useStdout();
-  const myPaneId = tmux.selfPaneId();
-  const myWindowId = tmux.selfWindowId();
+  // Resolved once: selfWindowId shells out to tmux, and the component renders
+  // ~8×/sec while a spinner is animating — a spawnSync per render is jank.
+  const [self] = useState(() => ({ pane: tmux.selfPaneId(), window: tmux.selfWindowId() }));
+  const myPaneId = self.pane;
+  const myWindowId = self.window;
 
   const [dims, setDims] = useState({
     cols: stdout?.columns ?? 40,
@@ -420,6 +445,10 @@ function Dashboard() {
   const [typing, setTyping] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState('');
+  // The row being renamed, captured when `n` is pressed. The list keeps
+  // re-sorting under the prompt; committing against the *current* selection
+  // could rename whatever drifted under the cursor.
+  const [renameKey, setRenameKey] = useState('');
   const [help, setHelp] = useState(false);
 
   const refresh = useCallback(() => setRows(buildRows()), []);
@@ -472,7 +501,14 @@ function Dashboard() {
     (row: Row | undefined) => {
       if (!row) return;
       if (row.live) {
-        setSelectedKey(row.live.paneId);
+        if (row.status === 'dead') {
+          // claude exited but the pane was kept (remain-on-exit) — restart it
+          // in place, resuming its transcript when we know one.
+          const rid =
+            row.historical?.id ?? (row.live.resumeId !== 'new' ? row.live.resumeId : undefined);
+          tmux.respawnSession(row.live.paneId, rid, row.historical?.cwd || row.cwd);
+        }
+        setSelectedKey(row.key);
         showOnStage(row.live.paneId);
         return;
       }
@@ -483,7 +519,7 @@ function Dashboard() {
           cwd: row.historical.cwd,
         });
         if (pane) {
-          setSelectedKey(pane.paneId);
+          setSelectedKey(row.historical.id); // row keys are transcript ids
           showOnStage(pane.paneId);
         }
         refresh();
@@ -515,18 +551,20 @@ function Dashboard() {
   );
 
   const commitRename = useCallback(() => {
-    const row = selected;
+    const row = rows.find((r) => r.key === renameKey);
     const v = renameValue.trim();
     if (row && v) {
       // permanent rename keys off the transcript id (historical or resumed)
       const sid = row.historical?.id ?? (row.live && row.live.resumeId !== 'new' ? row.live.resumeId : undefined);
       if (sid) setName(sid, v);
-      // keep the live label in sync so the change shows immediately
-      if (row.live) tmux.setPaneTag(row.live.paneId, `s|${row.live.resumeId}|${v.slice(0, 40)}`);
+      // keep the live label in sync so the change shows immediately — using the
+      // transcript id when we have one, so a rename during the adoption window
+      // can't revert the pin back to 'new'
+      if (row.live) tmux.setPaneTag(row.live.paneId, `s|${sid ?? 'new'}|${v.slice(0, 40)}`);
       refresh();
     }
     setRenaming(false); // empty input = cancel (no change)
-  }, [selected, renameValue, refresh]);
+  }, [rows, renameKey, renameValue, refresh]);
 
   const killSelected = useCallback(() => {
     if (!selected?.live) return;
@@ -536,8 +574,11 @@ function Dashboard() {
       if (ph) showOnStage(ph.paneId);
     }
     tmux.killPane(victim);
+    // showOnStage focused the placeholder (right for Enter, wrong here) —
+    // pull focus back so j/k/x keep working after a kill.
+    tmux.selectPane(myPaneId);
     refresh();
-  }, [selected, currentStage, showOnStage, refresh]);
+  }, [selected, currentStage, showOnStage, refresh, myPaneId]);
 
   useInput((input, key) => {
     // text-entry modes capture everything; Ctrl-C / Esc cancel them
@@ -583,6 +624,7 @@ function Dashboard() {
     } else if (input === 'n') {
       if (selected) {
         setRenameValue(''); // n = name/rename the highlighted chat (type the new name)
+        setRenameKey(selected.key);
         setRenaming(true);
       }
     } else if (input === 'N') {
@@ -621,7 +663,7 @@ function Dashboard() {
       <Box width={dims.cols}>
         {renaming ? (
           <Text wrap="truncate">
-            <Text dimColor>name “{selected?.title ?? ''}”: </Text>
+            <Text dimColor>name “{rows.find((r) => r.key === renameKey)?.title ?? ''}”: </Text>
             <Text color="yellow">{renameValue}</Text>▏
           </Text>
         ) : typing ? (
@@ -667,11 +709,13 @@ function Dashboard() {
           <Text dimColor wrap="truncate">
             {shortPath(selected.cwd)}
           </Text>
-          {selected.status === 'external' && (
-            <Text color="yellow" wrap="truncate">
-              ● active in another window — wait for it to go idle to resume
-            </Text>
-          )}
+          <Text color="yellow" wrap="truncate">
+            {selected.status === 'external'
+              ? '● active in another window — wait for it to go idle to resume'
+              : selected.status === 'dead'
+                ? '✗ claude exited — Enter restarts it here'
+                : ' '}
+          </Text>
         </Box>
       )}
       </>
