@@ -79,6 +79,17 @@ export function paneByTag(tag: string): PaneInfo | undefined {
   return listPanes().find((p) => p.tag === tag);
 }
 
+/** True if a pane with this id currently exists on the server. */
+export function paneExists(paneId: string): boolean {
+  if (!paneId) return false;
+  return listPanes().some((p) => p.paneId === paneId);
+}
+
+/** Width (in cols) of the attached client — the whole terminal — or 0 if none. */
+export function clientWidth(): number {
+  return Number(tmux(['display-message', '-p', '#{client_width}']).stdout) || 0;
+}
+
 /** The pane this process is running in. Uses $TMUX_PANE (set by tmux in every
  *  pane) so it resolves even when no client is attached. */
 export function selfPaneId(): string {
@@ -123,6 +134,16 @@ export function selectPane(paneId: string): void {
 /** Bring `src` into `dst`'s position; `dst` is sent to `src`'s old position. */
 export function swapPane(srcPaneId: string, dstPaneId: string): void {
   tmux(['swap-pane', '-s', srcPaneId, '-t', dstPaneId]);
+}
+
+/**
+ * Move `src` into `target`'s window as a right-hand split (`target` on the left).
+ * Used to re-establish the stage slot when the staged session exited and closed
+ * its pane, collapsing the dashboard window back to just the sidebar — there's
+ * nothing left to swap against, so we splice the chosen pane back in instead.
+ */
+export function joinPaneRight(srcPaneId: string, targetPaneId: string): void {
+  tmux(['join-pane', '-h', '-s', srcPaneId, '-t', targetPaneId]);
 }
 
 export function killPane(paneId: string): void {

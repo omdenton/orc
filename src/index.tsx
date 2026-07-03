@@ -416,13 +416,24 @@ function Dashboard() {
   const showOnStage = useCallback(
     (paneId: string) => {
       if (!paneId) return;
-      if (paneId !== stagePaneId) {
+      // The staged session can exit on its own (you quit claude, or it crashed).
+      // Its pane then closes and the dashboard window collapses back to just the
+      // sidebar, leaving stagePaneId dangling — swap-pane against it would fail
+      // ("can't find pane") and nothing would appear. Detect that and splice the
+      // chosen pane back in as a fresh right-hand split instead.
+      if (!tmux.paneExists(stagePaneId)) {
+        tmux.joinPaneRight(paneId, myPaneId);
+        // join-pane leaves a 50/50 split; restore the sidebar to its normal width.
+        const cols = tmux.clientWidth();
+        if (cols) tmux.resizePaneWidth(myPaneId, Math.max(24, Math.min(LEFT_COLS, Math.floor(cols * 0.42))));
+        setStagePaneId(paneId);
+      } else if (paneId !== stagePaneId) {
         tmux.swapPane(paneId, stagePaneId);
         setStagePaneId(paneId);
       }
       tmux.selectPane(paneId); // jump focus into the session
     },
-    [stagePaneId],
+    [stagePaneId, myPaneId],
   );
 
   const openRow = useCallback(
