@@ -79,12 +79,6 @@ export function paneByTag(tag: string): PaneInfo | undefined {
   return listPanes().find((p) => p.tag === tag);
 }
 
-/** True if a pane with this id currently exists on the server. */
-export function paneExists(paneId: string): boolean {
-  if (!paneId) return false;
-  return listPanes().some((p) => p.paneId === paneId);
-}
-
 /** Width (in cols) of the attached client — the whole terminal — or 0 if none. */
 export function clientWidth(): number {
   return Number(tmux(['display-message', '-p', '#{client_width}']).stdout) || 0;

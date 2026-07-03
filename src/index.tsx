@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { render, Box, Text, useInput, useStdout } from 'ink';
-import Spinner from 'ink-spinner';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import * as tmux from './tmux.js';
@@ -94,7 +93,30 @@ function bootstrap() {
       tmux.respawnPane(dash.paneId, paneCmd('__pane'));
       tmux.setPaneOption(dash.paneId, 'remain-on-exit', 'on');
     }
-    // otherwise healthy → just attach
+    // The stage slot may have collapsed (the staged claude exited, closing its
+    // pane and its half of the window). Restore the two-pane layout before
+    // attaching, so the user isn't left with a full-width sidebar: rejoin the
+    // existing placeholder if one is parked in a background window (it gets
+    // swapped out there whenever a session is staged), else split a fresh one.
+    // The sidebar width re-pins via the client-attached hook.
+    if (dash) {
+      const stage = tmux
+        .listPanes()
+        .find((p) => p.windowId === dash.windowId && p.paneId !== dash.paneId);
+      if (!stage) {
+        const parked = tmux.paneByTag(tmux.PLACEHOLDER_TAG);
+        if (parked) {
+          tmux.joinPaneRight(parked.paneId, dash.paneId);
+        } else {
+          tmux.splitRight(dash.paneId, paneCmd('__placeholder'));
+          const ph = tmux
+            .listPanes()
+            .find((p) => p.windowId === dash.windowId && p.paneId !== dash.paneId);
+          if (ph) tmux.setPaneTag(ph.paneId, tmux.PLACEHOLDER_TAG);
+        }
+        tmux.selectPane(dash.paneId);
+      }
+    }
   }
 
   const code = tmux.attachBlocking();
@@ -328,13 +350,16 @@ function pad(s: string, n: number): string {
   return (base + '…').padEnd(n);
 }
 
-function StatusGlyph({ status }: { status: RowStatus }) {
-  if (status === 'running')
-    return (
-      <Text color="cyan">
-        <Spinner type="dots" />
-      </Text>
-    );
+// One spinner clock for ALL running rows. ink-spinner gives every <Spinner> its
+// own 80ms interval; with N running sessions that's N staggered timers, each
+// tick forcing Ink to erase + rewrite the entire frame (Ink has no cell diff) —
+// measured ~23 full-frame repaints/sec with 3 spinners, which is what made the
+// sidebar shimmer. A single shared clock renders once per tick for everyone.
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPINNER_MS = 120;
+
+function StatusGlyph({ status, spin }: { status: RowStatus; spin: string }) {
+  if (status === 'running') return <Text color="cyan">{spin}</Text>;
   if (status === 'ready')
     return (
       <Text color="green" bold>
@@ -377,11 +402,15 @@ function Dashboard() {
   const visibleRows = Math.max(3, dims.rows - CHROME_LINES);
   const titleWidth = Math.max(8, dims.cols - 5); // prefix(2) + glyph(1) + space(1) + margin
 
-  const initialStage = tmux
-    .listPanes()
-    .find((p) => p.windowId === myWindowId && p.paneId !== myPaneId);
+  // The stage = the other pane of the dashboard window. Always derived from
+  // tmux, never cached in React state: the staged pane can vanish out from
+  // under us (the session exits → its pane closes), and a cached id then
+  // dangles — the original "Enter does nothing after claude quit" bug.
+  const currentStage = useCallback(
+    () => tmux.listPanes().find((p) => p.windowId === myWindowId && p.paneId !== myPaneId),
+    [myWindowId, myPaneId],
+  );
 
-  const [stagePaneId, setStagePaneId] = useState(initialStage?.paneId ?? '');
   const [rows, setRows] = useState<Row[]>([]);
   // Selection follows a session's stable identity (pane id for live rows,
   // transcript id for idle rows), NOT its slot — so the list can re-sort under
@@ -401,6 +430,16 @@ function Dashboard() {
     return () => clearInterval(t);
   }, [refresh]);
 
+  // Shared spinner clock — only ticks while something is actually running.
+  const hasRunning = rows.some((r) => r.status === 'running');
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!hasRunning) return;
+    const t = setInterval(() => setTick((n) => n + 1), SPINNER_MS);
+    return () => clearInterval(t);
+  }, [hasRunning]);
+  const spin = SPINNER_FRAMES[tick % SPINNER_FRAMES.length];
+
   const filtered = query
     ? rows.filter((r) => (r.title + ' ' + r.cwd).toLowerCase().includes(query.toLowerCase()))
     : rows;
@@ -413,24 +452,20 @@ function Dashboard() {
   const showOnStage = useCallback(
     (paneId: string) => {
       if (!paneId) return;
-      // The staged session can exit on its own (you quit claude, or it crashed).
-      // Its pane then closes and the dashboard window collapses back to just the
-      // sidebar, leaving stagePaneId dangling — swap-pane against it would fail
-      // ("can't find pane") and nothing would appear. Detect that and splice the
-      // chosen pane back in as a fresh right-hand split instead.
-      if (!tmux.paneExists(stagePaneId)) {
+      const stage = currentStage();
+      if (!stage) {
+        // Stage slot collapsed (the staged session exited, closing its pane).
+        // Nothing to swap against — splice the chosen pane back in as a fresh
+        // right-hand split, then restore the sidebar from the 50/50 default.
         tmux.joinPaneRight(paneId, myPaneId);
-        // join-pane leaves a 50/50 split; restore the sidebar to its normal width.
         const cols = tmux.clientWidth();
         if (cols) tmux.resizePaneWidth(myPaneId, Math.max(24, Math.min(LEFT_COLS, Math.floor(cols * 0.42))));
-        setStagePaneId(paneId);
-      } else if (paneId !== stagePaneId) {
-        tmux.swapPane(paneId, stagePaneId);
-        setStagePaneId(paneId);
+      } else if (paneId !== stage.paneId) {
+        tmux.swapPane(paneId, stage.paneId);
       }
       tmux.selectPane(paneId); // jump focus into the session
     },
-    [stagePaneId, myPaneId],
+    [currentStage, myPaneId],
   );
 
   const openRow = useCallback(
@@ -496,13 +531,13 @@ function Dashboard() {
   const killSelected = useCallback(() => {
     if (!selected?.live) return;
     const victim = selected.live.paneId;
-    if (stagePaneId === victim) {
+    if (currentStage()?.paneId === victim) {
       const ph = tmux.paneByTag(tmux.PLACEHOLDER_TAG);
       if (ph) showOnStage(ph.paneId);
     }
     tmux.killPane(victim);
     refresh();
-  }, [selected, stagePaneId, showOnStage, refresh]);
+  }, [selected, currentStage, showOnStage, refresh]);
 
   useInput((input, key) => {
     // text-entry modes capture everything; Ctrl-C / Esc cancel them
@@ -543,7 +578,8 @@ function Dashboard() {
       // it's not openable; wait for it to go idle. Dormant rows open normally.
       if (selected?.status !== 'external') openRow(selected);
     } else if (key.tab) {
-      tmux.selectPane(stagePaneId); // focus the session without changing selection
+      const stage = currentStage();
+      if (stage) tmux.selectPane(stage.paneId); // focus the session without changing selection
     } else if (input === 'n') {
       if (selected) {
         setRenameValue(''); // n = name/rename the highlighted chat (type the new name)
@@ -608,7 +644,7 @@ function Dashboard() {
           return (
             <Box key={r.key} width={dims.cols}>
               <Text>{active ? '❯ ' : '  '}</Text>
-              <StatusGlyph status={r.status} />
+              <StatusGlyph status={r.status} spin={spin} />
               <Text> </Text>
               <Text
                 backgroundColor={active ? 'cyan' : undefined}
@@ -649,6 +685,16 @@ function Dashboard() {
 // ===========================================================================
 const mode = process.argv[2];
 if (mode === '__pane') {
+  // Ink repaints by erasing and rewriting the whole frame; mid-repaint the
+  // terminal can paint a half-erased screen, which reads as flicker. Bracket
+  // every write in DEC 2026 synchronized-update guards so tmux (3.4+) applies
+  // each frame atomically. Terminals without 2026 ignore the sequences.
+  const rawWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = ((chunk: unknown, ...rest: unknown[]) =>
+    (rawWrite as (...a: unknown[]) => boolean)(
+      typeof chunk === 'string' ? `\x1b[?2026h${chunk}\x1b[?2026l` : chunk,
+      ...rest,
+    )) as typeof process.stdout.write;
   render(<Dashboard />, { exitOnCtrlC: false }); // we handle Ctrl-C ourselves
 } else if (mode === '__placeholder') {
   placeholder();

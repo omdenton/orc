@@ -8,6 +8,8 @@ import {
   listPanes,
   setPaneTag,
   swapPane,
+  joinPaneRight,
+  killPane,
   capturePane,
   liveSessions,
   classifyCapture,
@@ -97,6 +99,23 @@ check('A still ticking off-stage', !!aLive && /A tick/.test(capturePane(aLive.pa
 const sessions = liveSessions();
 check('two live sessions tracked', sessions.length === 2);
 check('labels recovered from tags', sessions.some((s) => s.label === 'Session A') && sessions.some((s) => s.label === 'Session B'));
+
+// Stage collapse + recovery: the staged pane dying closes its half of the
+// dashboard window; a fresh session must be spliced back in with join-pane
+// (swap-pane has nothing to target). Mirrors showOnStage's recovery branch.
+console.log('stage collapse recovery:');
+killPane(stagePaneId); // B dies while on stage
+sleep(300);
+const dashPanes = () => listPanes().filter((p) => p.windowId === dashWindow);
+check('stage slot collapsed to sidebar only', dashPanes().length === 1);
+raw(['new-session', '-d', '-s', 'orc-c', counter('C')]);
+const cPane = listPanes().find((p) => p.session === 'orc-c')!;
+setPaneTag(cPane.paneId, 's|id-ccc|Session C');
+joinPaneRight(cPane.paneId, left.paneId);
+stagePaneId = cPane.paneId;
+sleep(1800);
+check('C joined onto the recovered stage', dashPanes().length === 2 && /C tick/.test(stageText()));
+check('C still tracked as a live session', liveSessions().some((s) => s.resumeId === 'id-ccc'));
 
 console.log('status classifier:');
 // Real bottom-chrome captures (the live status lives only in the last few lines).
