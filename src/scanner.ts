@@ -25,6 +25,9 @@ export interface Session {
    *  permission-mode / ai-title / last-prompt sidecar records — so it reflects
    *  "last time I messaged or claude was active", which is the sidebar order. */
   lastActivityMs: number;
+  /** ms timestamp of the FIRST conversational record — effectively when the
+   *  session was created. 0 if the transcript has no timestamped turns. */
+  firstActivityMs: number;
   /** type of the final transcript record */
   lastType: string;
   /** true when the last *conversational* record is a user turn with no
@@ -78,6 +81,7 @@ function parseFile(path: string, mtimeMs: number): Session {
   let lastRole = ''; // role of the last user/assistant record (ignores metadata lines)
   let firstUserText = '';
   let lastActivityMs = 0; // newest conversational-record timestamp
+  let firstActivityMs = 0; // oldest conversational-record timestamp
 
   let text = '';
   try {
@@ -103,6 +107,7 @@ function parseFile(path: string, mtimeMs: number): Session {
       if (typeof r.timestamp === 'string') {
         const t = Date.parse(r.timestamp);
         if (t > lastActivityMs) lastActivityMs = t;
+        if (!firstActivityMs || t < firstActivityMs) firstActivityMs = t;
       }
     }
     if (!cwd && typeof r.cwd === 'string') cwd = r.cwd;
@@ -135,9 +140,26 @@ function parseFile(path: string, mtimeMs: number): Session {
     messageCount,
     mtimeMs,
     lastActivityMs: lastActivityMs || mtimeMs,
+    firstActivityMs,
     lastType,
     awaitingReply: lastRole === 'user',
   };
+}
+
+/**
+ * May a brand-new orc pane (born at `bornMs`) adopt this transcript as its own?
+ * Its own transcript can only have STARTED after the pane existed, so the first
+ * conversational timestamp must be ≥ born. A transcript merely *modified* after
+ * born is not enough — a claude running OUTSIDE orc in the same cwd (another
+ * terminal/IDE) keeps bumping its transcript, and matching on mtime alone let a
+ * new pane steal that session's identity. `bornMs === 0` (panes predating the
+ * born field) and `firstActivityMs === 0` (no timestamped turns) fall back to
+ * the permissive old behaviour.
+ */
+export function canAdopt(s: Session, bornMs: number): boolean {
+  if (s.mtimeMs < bornMs) return false;
+  if (!bornMs || !s.firstActivityMs) return true;
+  return s.firstActivityMs >= bornMs;
 }
 
 /** Scan ~/.claude/projects for all sessions, newest-first. mtime-cached. */

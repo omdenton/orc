@@ -4,7 +4,7 @@ import Spinner from 'ink-spinner';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import * as tmux from './tmux.js';
-import { scanSessions, type Session } from './scanner.js';
+import { scanSessions, canAdopt, type Session } from './scanner.js';
 import { loadNames, setName } from './names.js';
 
 const ORC_BIN = fileURLToPath(new URL('../bin/orc.mjs', import.meta.url));
@@ -214,13 +214,10 @@ function buildRows(): Row[] {
     }
     // Brand-new session: no resume id yet. Don't borrow a pre-existing
     // transcript's identity — only adopt one this pane created itself, i.e. a
-    // transcript in the same cwd touched at/after the pane was born (which
-    // happens once the user sends a first message). Until then it's just
-    // "new session". `born === 0` (sessions created before this field existed)
-    // falls back to the old freshest-in-cwd behaviour.
-    const h = history.find(
-      (x) => x.cwd === l.cwd && !claimed.has(x.id) && x.mtimeMs >= l.born,
-    );
+    // transcript in the same cwd whose first turn happened at/after the pane
+    // was born (which happens once the user sends a first message). Until then
+    // it's just "new session". See canAdopt for why mtime alone isn't enough.
+    const h = history.find((x) => x.cwd === l.cwd && !claimed.has(x.id) && canAdopt(x, l.born));
     if (h) {
       claimed.add(h.id);
       // Pin the identity to the real transcript id so subsequent polls take the
