@@ -3,7 +3,7 @@ import { render, Box, Text, useInput, useStdout } from 'ink';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import * as tmux from './tmux.js';
-import { scanSessions, canAdopt, type Session } from './scanner.js';
+import { scanSessions, canAdopt, collapseForks, type Session } from './scanner.js';
 import { loadNames, setName } from './names.js';
 
 const ORC_BIN = fileURLToPath(new URL('../bin/orc.mjs', import.meta.url));
@@ -69,6 +69,13 @@ function createDashboard() {
   // vertical pane moves are meaningless; drop them so they're inert.
   tmux.unbindRootKey('M-Up');
   tmux.unbindRootKey('M-Down');
+  // Same story for the Enter splits: terminals send Shift/Ctrl-Enter as an
+  // ESC-prefixed CR (that's what `claude /terminal-setup` configures), which
+  // tmux reads as M-Enter and splits on — so a newline in claude's composer
+  // spawns a pane instead. Splits are meaningless here anyway; drop them so
+  // the key falls through to the hosted session.
+  tmux.unbindRootKey('M-Enter');
+  tmux.unbindRootKey('M-S-Enter');
 
   tmux.selectPane(left.paneId);
 }
@@ -202,33 +209,73 @@ function liveStatus(captureStatus: tmux.Status, h?: Session): tmux.Status {
   return captureStatus;
 }
 
+// Row-key renames from the last buildRows pass (old key → new key), written
+// when a fork re-pins a live row's identity. The Dashboard applies these to
+// its selection (and an in-flight rename target) right after each refresh, so
+// the highlight rides across the rebind instead of snapping to the top.
+const keyAliases = new Map<string, string>();
+
 function buildRows(): Row[] {
   const live = tmux.liveSessions();
   const history = scanSessions(); // newest mtime first
+  // `--resume` forks a new transcript file (see Session.firstUuid); collapse
+  // each conversation to its newest file so ancestors don't render as
+  // duplicate rows, and so live panes can follow their transcript forward.
+  const { sessions: current, canonical } = collapseForks(history);
   const names = loadNames();
+  keyAliases.clear();
 
   // Transcript ids already represented by a live row — so they don't also show
-  // up as a duplicate idle row below.
+  // up as a duplicate idle row below. Resolve every resumed pane's transcript
+  // up front (before the render loop and before new-pane adoption): follow the
+  // pane's resumeId to the conversation's newest fork, first-come wins if two
+  // panes somehow land on the same conversation (the loser keeps its own file).
   const claimed = new Set<string>();
-  // Reserve resumed sessions' transcripts up front, so a brand-new session in
-  // the same cwd can't accidentally claim one of them.
-  for (const l of live) {
-    if (l.resumeId !== 'new') {
-      const h = history.find((x) => x.id === l.resumeId);
-      if (h) claimed.add(h.id);
+  const binding = new Map<string, Session | undefined>(); // paneId → transcript
+  // Bind live panes before dead ones: a remain-on-exit corpse referencing the
+  // same conversation (e.g. a duplicate row opened pre-collapse, since exited)
+  // must not steal the head transcript from the pane actually writing it.
+  const ordered = [...live].sort(
+    (a, b) => Number(a.status === 'dead') - Number(b.status === 'dead'),
+  );
+  for (const l of ordered) {
+    if (l.resumeId === 'new') continue;
+    const head = canonical.get(l.resumeId);
+    const h =
+      head && !claimed.has(head.id)
+        ? head
+        : history.find((x) => x.id === l.resumeId && !claimed.has(x.id));
+    if (h) {
+      claimed.add(h.id);
+      if (h.id !== l.resumeId) {
+        // The transcript forked under this pane. Carry a saved rename onto the
+        // fork, re-pin the tag so the pane (and a dead-restart) resumes the
+        // NEW file — resuming the stale ancestor would drop the recent turns —
+        // and record the key change for the selection.
+        if (names[l.resumeId] && !names[h.id]) {
+          setName(h.id, names[l.resumeId]);
+          names[h.id] = names[l.resumeId];
+        }
+        tmux.setPaneTag(l.paneId, `s|${h.id}|${(names[h.id] ?? l.label ?? h.title).slice(0, 40)}`);
+        keyAliases.set(l.resumeId, h.id);
+      }
     }
+    binding.set(l.paneId, h);
   }
 
   const rows: Row[] = [];
   for (const l of live) {
     if (l.resumeId !== 'new') {
-      const h = history.find((x) => x.id === l.resumeId);
+      const h = binding.get(l.paneId);
+      // Unbound pane whose transcript another pane owns → key by pane id so
+      // two rows can never collide on the same transcript key.
+      const key = h?.id ?? (claimed.has(l.resumeId) ? l.paneId : l.resumeId);
       rows.push({
         // Row identity keys off the transcript id, not the pane id: it stays
         // the same across idle → live → idle transitions, so the selection
         // (and a rename in progress) can't silently retarget another session.
-        key: l.resumeId,
-        title: names[l.resumeId] ?? h?.title ?? l.label ?? '(new session)',
+        key,
+        title: names[key] ?? h?.title ?? l.label ?? '(new session)',
         cwd: l.cwd,
         status: liveStatus(l.status, h),
         mtime: h?.lastActivityMs ?? Date.now(),
@@ -237,18 +284,25 @@ function buildRows(): Row[] {
       });
       continue;
     }
-    // Brand-new session: no resume id yet. Don't borrow a pre-existing
-    // transcript's identity — only adopt one this pane created itself, i.e. a
-    // transcript in the same cwd whose first turn happened at/after the pane
-    // was born (which happens once the user sends a first message). Until then
-    // it's just "new session". See canAdopt for why mtime alone isn't enough.
-    // With TWO unadopted new panes in the same cwd the first-turn test can't
-    // tell whose transcript it is — adopting would pin the id onto whichever
-    // pane polls first, possibly the wrong one. Defer until it's unambiguous.
-    const rivals = live.filter((x) => x.resumeId === 'new' && x.cwd === l.cwd).length;
-    const h =
-      rivals === 1
-        ? history.find((x) => x.cwd === l.cwd && !claimed.has(x.id) && canAdopt(x, l.born))
+    // Brand-new session: no resume id yet, so find the transcript this pane
+    // wrote itself (it appears once the user sends a first message). Until then
+    // it's just "new session".
+    //
+    // Panes we started know their transcript's name up front (createSession
+    // hands claude a `--session-id`), so this is an exact id match — no timing
+    // guess, and any number of new panes can share a cwd.
+    //
+    // Panes predating @orc_sid fall back to the old heuristic: a transcript in
+    // the same cwd whose first turn happened at/after the pane was born (see
+    // canAdopt for why mtime alone isn't enough). That test can't tell two
+    // sid-less panes in one cwd apart, so it stays deferred while rivals exist
+    // — those panes stall on "new session" until restarted, which is why the
+    // pre-assigned id replaced it.
+    const legacyRivals = live.filter((x) => x.resumeId === 'new' && !x.sid && x.cwd === l.cwd).length;
+    const h = l.sid
+      ? current.find((x) => x.id === l.sid && !claimed.has(x.id))
+      : legacyRivals === 1
+        ? current.find((x) => x.cwd === l.cwd && !claimed.has(x.id) && canAdopt(x, l.born))
         : undefined;
     // A rename of a not-yet-adopted session lives only in the tag label.
     const customLabel = l.label && l.label !== 'new session' ? l.label : '';
@@ -275,7 +329,7 @@ function buildRows(): Row[] {
       historical: h,
     });
   }
-  for (const h of history) {
+  for (const h of current) {
     if (claimed.has(h.id)) continue;
     rows.push({
       key: h.id,
@@ -451,7 +505,13 @@ function Dashboard() {
   const [renameKey, setRenameKey] = useState('');
   const [help, setHelp] = useState(false);
 
-  const refresh = useCallback(() => setRows(buildRows()), []);
+  const refresh = useCallback(() => {
+    setRows(buildRows());
+    // A fork rebind renames row keys (old transcript id → new) — follow it, so
+    // the highlight / an in-flight rename stay on the same session.
+    setSelectedKey((k) => keyAliases.get(k) ?? k);
+    setRenameKey((k) => keyAliases.get(k) ?? k);
+  }, []);
 
   useEffect(() => {
     refresh();
@@ -744,6 +804,16 @@ if (mode === '__pane') {
   placeholder();
 } else if (mode === 'kill') {
   tmux.killServer(); // `orc kill` — clean teardown without remembering the tmux command
+  process.exit(0);
+} else if (mode === '__rows') {
+  // Debug: print the sidebar model without the UI (one line per row). Reads
+  // the same tmux socket + transcripts a dashboard would; its only writes are
+  // the fork re-pins buildRows always does.
+  for (const r of buildRows()) {
+    console.log(
+      `${r.status.padEnd(8)} ${r.live?.paneId?.padEnd(5) ?? '-    '} ${r.key}  ${r.title}`,
+    );
+  }
   process.exit(0);
 } else {
   bootstrap();

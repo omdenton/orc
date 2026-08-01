@@ -30,10 +30,23 @@ export interface Session {
   firstActivityMs: number;
   /** type of the final transcript record */
   lastType: string;
+  /** uuid of the first conversational record. `claude --resume` (since ~mid
+   *  2026) FORKS: it copies the history into a NEW session file (new id) and
+   *  continues there, leaving the old file behind. The copied records keep
+   *  their uuids, so this value survives the fork and identifies the logical
+   *  conversation across all its files. '' if no uuid'd turns yet. */
+  firstUuid: string;
   /** true when the last *conversational* record is a user turn with no
    *  assistant reply yet — i.e. a turn is in flight. Used (gated on recency) to
    *  tell a session that's actively generating from a dormant one. */
   awaitingReply: boolean;
+  /** true for a resume stub: `claude --resume` writes the inherited
+   *  ai-title/agent-name into the fork's NEW file immediately, so quitting
+   *  without sending a message leaves a transcript with a title but zero
+   *  turns. It has no firstUuid to collapse on, so it would render as a
+   *  duplicate of its parent. (A genuinely new session can't look like this —
+   *  titles are only generated after the first exchange.) */
+  isStub: boolean;
 }
 
 interface CacheEntry {
@@ -78,10 +91,12 @@ function parseFile(path: string, mtimeMs: number): Session {
   let permissionMode = '';
   let messageCount = 0;
   let lastType = '';
+  let firstUuid = '';
   let lastRole = ''; // role of the last user/assistant record (ignores metadata lines)
   let firstUserText = '';
   let lastActivityMs = 0; // newest conversational-record timestamp
   let firstActivityMs = 0; // oldest conversational-record timestamp
+  let sawAiTitle = false;
 
   let text = '';
   try {
@@ -101,6 +116,7 @@ function parseFile(path: string, mtimeMs: number): Session {
     if (r.type) lastType = r.type;
     if (r.type === 'user' || r.type === 'assistant') {
       lastRole = r.type;
+      if (!firstUuid && typeof r.uuid === 'string') firstUuid = r.uuid;
       // Track the newest turn timestamp. Sub-agent (sidechain) turns count too —
       // they mean the session is actively working. Metadata records carry no
       // timestamp and so never bump this.
@@ -115,7 +131,10 @@ function parseFile(path: string, mtimeMs: number): Session {
     if (typeof r.messageCount === 'number' && r.messageCount > messageCount) {
       messageCount = r.messageCount;
     }
-    if (r.type === 'ai-title' && r.aiTitle) title = r.aiTitle;
+    if (r.type === 'ai-title' && r.aiTitle) {
+      title = r.aiTitle;
+      sawAiTitle = true;
+    }
     if (r.type === 'last-prompt') lastPrompt = r.lastPrompt || r.content || lastPrompt;
     if (r.type === 'permission-mode' && r.permissionMode) permissionMode = r.permissionMode;
     if (!firstUserText && r.type === 'user' && r.message && !r.isMeta) {
@@ -142,8 +161,86 @@ function parseFile(path: string, mtimeMs: number): Session {
     lastActivityMs: lastActivityMs || mtimeMs,
     firstActivityMs,
     lastType,
+    firstUuid,
     awaitingReply: lastRole === 'user',
+    isStub: sawAiTitle && lastRole === '',
   };
+}
+
+// Sidecar activity: Claude Code now writes sub-agent transcripts and workflow
+// state NEXT TO the session file — <project>/<session-id>/subagents/…,
+// including workflow agents nested at subagents/workflows/wf_*/agent-*.jsonl —
+// instead of interleaving them in the main .jsonl. While a session waits on
+// sub-agents its main transcript goes completely quiet, so the busy signal
+// must fold these mtimes in or the row shows a false green "ready".
+// tool-results/ is skipped — it's only written during main-transcript turns,
+// which already bump the main file — as is workflows/scripts/ (write-once).
+function newestFileMs(dir: string, depth: number): number {
+  let max = 0;
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0; // no such sidecar — the common case
+  }
+  for (const e of entries) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) {
+      if (depth > 0 && e.name !== 'scripts') max = Math.max(max, newestFileMs(p, depth - 1));
+      continue;
+    }
+    try {
+      const st = statSync(p);
+      if (st.mtimeMs > max) max = st.mtimeMs;
+    } catch {
+      /* raced a delete — skip */
+    }
+  }
+  return max;
+}
+
+function sidecarActivityMs(projectDir: string, id: string): number {
+  return Math.max(
+    newestFileMs(join(projectDir, id, 'subagents'), 2),
+    newestFileMs(join(projectDir, id, 'workflows'), 1),
+  );
+}
+
+export interface ForkView {
+  /** one session per logical conversation — the newest fork — newest-first */
+  sessions: Session[];
+  /** every member id (ancestors AND the head itself) → the head session */
+  canonical: Map<string, Session>;
+}
+
+/**
+ * Collapse `--resume` forks: group transcripts by the conversation they belong
+ * to (firstUuid — see Session.firstUuid) and keep only the most recently
+ * written file of each group. Without this every reopen of a session leaves a
+ * stale ancestor file behind that would render as a duplicate sidebar row.
+ */
+export function collapseForks(all: Session[]): ForkView {
+  const groups = new Map<string, Session[]>();
+  for (const s of all) {
+    const key = s.firstUuid || s.id; // no turns yet → its own group
+    const g = groups.get(key);
+    if (g) g.push(s);
+    else groups.set(key, [s]);
+  }
+  const sessions: Session[] = [];
+  const canonical = new Map<string, Session>();
+  for (const g of groups.values()) {
+    const head = g.reduce((a, b) => (b.mtimeMs > a.mtimeMs ? b : a));
+    // Resume stubs (see Session.isStub) can't be grouped with their parent —
+    // no turns, no firstUuid — so hide them rather than show a duplicate row.
+    // Once a message is sent in the fork the file gains the copied history and
+    // collapses into its conversation normally. Still registered in canonical
+    // so a pane that somehow references the stub id resolves to something.
+    if (!head.isStub) sessions.push(head);
+    for (const s of g) canonical.set(s.id, head);
+  }
+  sessions.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return { sessions, canonical };
 }
 
 /**
@@ -192,12 +289,24 @@ export function scanSessions(): Session[] {
         continue;
       }
       const cached = cache.get(p);
+      let session: Session;
       if (cached && cached.mtimeMs === st.mtimeMs) {
-        out.push(cached.session);
-        continue;
+        session = cached.session;
+      } else {
+        session = parseFile(p, st.mtimeMs);
+        cache.set(p, { mtimeMs: st.mtimeMs, session });
       }
-      const session = parseFile(p, st.mtimeMs);
-      cache.set(p, { mtimeMs: st.mtimeMs, session });
+      // Fold sub-agent / workflow sidecar writes into the session's effective
+      // freshness (the cache keeps the raw parse — keyed on the raw file
+      // mtime — so derive a copy rather than mutating it).
+      const sidecar = sidecarActivityMs(dir, session.id);
+      if (sidecar > session.mtimeMs) {
+        session = {
+          ...session,
+          mtimeMs: sidecar,
+          lastActivityMs: Math.max(session.lastActivityMs, sidecar),
+        };
+      }
       out.push(session);
     }
   }

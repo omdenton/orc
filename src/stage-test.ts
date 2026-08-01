@@ -14,6 +14,7 @@ import {
   liveSessions,
   classifyCapture,
 } from './tmux.js';
+import { collapseForks, type Session } from './scanner.js';
 
 // HARD SAFETY GUARD. This test calls `kill-server`, which tears down the entire
 // tmux server on SOCKET — including a live orc dashboard and every session it
@@ -130,6 +131,20 @@ const bgWaitScreen = `✻ Waiting for 1 dynamic workflow to finish\n\n${inputBox
 
 check('working mode line -> running', classifyCapture('node', workingScreen) === 'running');
 check('idle mode line -> ready', classifyCapture('claude', idleScreen) === 'ready');
+// Mid-2026 Claude Code can omit "esc to interrupt" from the mode line during a
+// working turn (seen with a queued message in the input box) — the animated
+// "Verb… (elapsed…" status line is then the only working signal on screen.
+const MODE_BARE = '  ⏵⏵ bypass permissions on (shift+tab to cycle)';
+const spinnerOnlyScreen = `✽ Doodling… (4m 59s · ↓ 13.2k tokens · thinking)\n${'─'.repeat(80)}\n❯ /new\n${'─'.repeat(80)}\n${MODE_BARE}`;
+check('working spinner w/o esc hint -> running', classifyCapture('claude', spinnerOnlyScreen) === 'running');
+const spinnerTipScreen = `✻ Shenaniganing… (37s · ↓ 1.9k tokens)\n  ⎿  Tip: Double-tap esc to rewind\n${inputBox}\n${MODE_BARE}`;
+check('working spinner above a tip line -> running', classifyCapture('claude', spinnerTipScreen) === 'running');
+// The done-state line has no "… (" and must NOT read as working.
+const doneScreen = `✻ Cooked for 21s\n${inputBox}\n${MODE_BARE}`;
+check('done-state "Cooked for 21s" -> ready', classifyCapture('claude', doneScreen) === 'ready');
+// A transcript line QUOTING a spinner starts with prose, failing the anchor.
+const quotedSpinner = `the footer showed "✽ Doodling… (4m 59s)" at the time\n${inputBox}\n${MODE_BARE}`;
+check('quoted spinner in body -> still ready', classifyCapture('claude', quotedSpinner) === 'ready');
 check('bg dynamic-workflow wait -> running', classifyCapture('node', bgWaitScreen) === 'running');
 check(
   'bg agents+workflow wait -> running',
@@ -145,6 +160,30 @@ const metaChatIdle =
   'I hardened the markers (dynamic workflow to finish / background agents to finish).\n' +
   `${'─'.repeat(80)}\n❯ \n${'─'.repeat(80)}\n${MODE_IDLE}\n  ⧉  orc · context`;
 check('marker phrases in transcript body -> still ready', classifyCapture('claude', metaChatIdle) === 'ready');
+
+console.log('fork collapse:');
+// `claude --resume` copies history into a NEW session file; collapseForks must
+// keep only the newest file of each conversation and map every ancestor to it.
+const fakeSession = (id: string, firstUuid: string, mtimeMs: number, isStub = false): Session =>
+  ({ id, firstUuid, mtimeMs, path: '', cwd: '/x', title: id, lastPrompt: '', gitBranch: '',
+     permissionMode: '', messageCount: 0, lastActivityMs: mtimeMs, firstActivityMs: 1,
+     lastType: 'assistant', awaitingReply: false, isStub });
+const a1 = fakeSession('a-old', 'uuid-a', 1000);
+const a2 = fakeSession('a-mid', 'uuid-a', 2000);
+const a3 = fakeSession('a-new', 'uuid-a', 3000);
+const b1 = fakeSession('b-solo', 'uuid-b', 1500);
+const fresh = fakeSession('c-empty', '', 500); // no turns yet — its own group
+// resume stub: inherited ai-title but no turns — must be hidden, not duplicated
+const stub = fakeSession('a-stub', '', 4000, true);
+const view = collapseForks([stub, a3, a2, b1, a1, fresh]);
+check('fork chain collapses to newest file', view.sessions.filter((s) => s.firstUuid === 'uuid-a').length === 1 && view.sessions.some((s) => s.id === 'a-new'));
+check('ancestors map to the head', view.canonical.get('a-old')?.id === 'a-new' && view.canonical.get('a-mid')?.id === 'a-new');
+check('head maps to itself', view.canonical.get('a-new')?.id === 'a-new');
+check('unrelated session untouched', view.canonical.get('b-solo')?.id === 'b-solo');
+check('turnless transcript keeps its own identity', view.canonical.get('c-empty')?.id === 'c-empty');
+check('resume stub hidden from sidebar', !view.sessions.some((s) => s.id === 'a-stub'));
+check('resume stub still resolvable via canonical', view.canonical.get('a-stub')?.id === 'a-stub');
+check('collapsed list is newest-first', view.sessions[0].id === 'a-new');
 
 raw(['kill-server']);
 console.log(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);

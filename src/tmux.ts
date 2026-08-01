@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 
@@ -52,6 +53,7 @@ export interface PaneInfo {
   cwd: string;
   dead: boolean; // process exited but pane kept (remain-on-exit)
   born: string; // @orc_born: ms timestamp the pane was created (or '' if unset)
+  sid: string; // @orc_sid: session id we handed claude at birth ('' if unset)
 }
 
 const PANE_FMT = [
@@ -63,6 +65,7 @@ const PANE_FMT = [
   '#{pane_current_path}',
   '#{pane_dead}',
   '#{@orc_born}',
+  '#{@orc_sid}',
 ].join('\t');
 
 export function listPanes(): PaneInfo[] {
@@ -71,8 +74,18 @@ export function listPanes(): PaneInfo[] {
   const out: PaneInfo[] = [];
   for (const line of r.stdout.split('\n')) {
     if (!line) continue;
-    const [session, windowId, paneId, tag, cmd, cwd, dead, born] = line.split('\t');
-    out.push({ session, windowId, paneId, tag: tag ?? '', cmd, cwd, dead: dead === '1', born: born ?? '' });
+    const [session, windowId, paneId, tag, cmd, cwd, dead, born, sid] = line.split('\t');
+    out.push({
+      session,
+      windowId,
+      paneId,
+      tag: tag ?? '',
+      cmd,
+      cwd,
+      dead: dead === '1',
+      born: born ?? '',
+      sid: sid ?? '',
+    });
   }
   return out;
 }
@@ -232,7 +245,16 @@ export type Status = 'running' | 'ready' | 'dead';
 // The interruptible-turn hint, shown in the bottom `⏵⏵` mode line only while a
 // turn is actively working: "… (shift+tab to cycle) · esc to interrupt · …".
 // Absent when idle. Scanned in the bottom few lines (chrome), never the body.
+// Newer Claude Code sometimes drops this hint mid-turn (e.g. with a queued
+// message in the input box), so it is no longer sufficient on its own — see
+// WORKING_STATUS_LINE.
 const WORKING_MODE_LINE = /\besc to interrupt\b/i;
+// The animated status line above the input box, present for the whole working
+// turn: "✽ Doodling… (4m 59s · ↓ 13.2k tokens · thinking)". Shape-anchored:
+// leading spinner glyph, one verb, ellipsis, then "(<elapsed>" — the done
+// state ("✻ Cooked for 21s") has no "… (" and can't match, and a transcript
+// line quoting the phrase starts with prose, failing the anchor.
+const WORKING_STATUS_LINE = /^\s*[^\w\s]\s+\w+…\s+\(\d+[hms]/imu;
 // The background-wait status line: shown when the main turn has ENDED but a
 // dynamic workflow / background agents (ultracode) are still running — there is
 // no "esc to interrupt" then. Real form: "✻ Waiting for 1 dynamic workflow to
@@ -255,6 +277,9 @@ export function classifyCapture(cmd: string, text: string): Status {
   if (!CLAUDE_CMDS.has(cmd)) return 'dead'; // dropped back to a shell
   // Mode line sits in the last ~5 lines (input box + mode/context chrome).
   if (WORKING_MODE_LINE.test(tailLines(text, 5))) return 'running';
+  // The working status line sits above the input box; tips / queued messages
+  // can push it a few lines up, so allow more headroom.
+  if (WORKING_STATUS_LINE.test(tailLines(text, 10))) return 'running';
   // The bg-wait status slot sits just above the input box; allow more headroom.
   if (BG_WAIT_FOOTER.test(tailLines(text, 10))) return 'running';
   return 'ready';
@@ -281,6 +306,10 @@ export interface LiveSession {
   cwd: string;
   status: Status;
   born: number; // ms timestamp the pane was created (0 if pre-dates this field)
+  /** For a brand-new session: the session id we pre-assigned it via
+   *  `--session-id`, so its transcript is identifiable the moment it appears
+   *  ('' for panes started before this existed). */
+  sid: string;
 }
 
 function parseSessionTag(tag: string): { resumeId: string; label: string } | null {
@@ -306,6 +335,7 @@ export function liveSessions(): LiveSession[] {
       cwd: p.cwd,
       status: statusOfPane(p),
       born: Number(p.born) || 0,
+      sid: p.sid,
     });
   }
   return out;
@@ -315,9 +345,13 @@ export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-function claudeCmd(resumeId?: string): string {
+// Resuming keys off an existing transcript; a brand-new session instead gets a
+// session id we choose, so its transcript is named before it exists and orc
+// never has to guess which pane wrote which file.
+function claudeCmd(resumeId?: string, sessionId?: string): string {
   const argv = ['claude', '--dangerously-skip-permissions'];
   if (resumeId && resumeId !== 'new') argv.push('--resume', resumeId);
+  else if (sessionId) argv.push('--session-id', sessionId);
   return argv.map(shellQuote).join(' ');
 }
 
@@ -339,7 +373,10 @@ export function createSession(opts: CreateOpts): PaneInfo | null {
   // `new-session -c <missing>` and the open would silently no-op.
   const cwd = existsSync(opts.cwd) ? opts.cwd : homedir();
 
-  const r = tmux(['new-session', '-d', '-s', name, '-c', cwd, claudeCmd(opts.resumeId)]);
+  const resuming = opts.resumeId && opts.resumeId !== 'new';
+  const sid = resuming ? '' : randomUUID();
+
+  const r = tmux(['new-session', '-d', '-s', name, '-c', cwd, claudeCmd(opts.resumeId, sid)]);
   if (r.code !== 0) return null;
 
   const pane = listPanes().find((p) => p.session === name);
@@ -347,6 +384,10 @@ export function createSession(opts: CreateOpts): PaneInfo | null {
 
   const tag = `${SESSION_TAG_PREFIX}${opts.resumeId ?? 'new'}|${opts.label}`;
   setPaneTag(pane.paneId, tag);
+  // The id claude will write its transcript under, so the UI can adopt that
+  // transcript by name the moment it appears (first message) rather than
+  // guessing from cwd + timing.
+  if (sid) setPaneOption(pane.paneId, '@orc_sid', sid);
   // Birth timestamp: lets the UI tell a brand-new session's own transcript
   // (written once the user sends a message) from pre-existing ones in the cwd.
   setPaneOption(pane.paneId, '@orc_born', String(Date.now()));
@@ -354,11 +395,16 @@ export function createSession(opts: CreateOpts): PaneInfo | null {
   // be restarted in place with Enter — instead of vanishing (and collapsing
   // the dashboard window if it was on stage).
   setPaneOption(pane.paneId, 'remain-on-exit', 'on');
-  return { ...pane, tag, born: String(Date.now()) };
+  return { ...pane, tag, born: String(Date.now()), sid };
 }
 
 /** Restart claude in a dead session pane (remain-on-exit corpse), in place. */
 export function respawnSession(paneId: string, resumeId: string | undefined, cwd: string): void {
   const dir = existsSync(cwd) ? cwd : homedir();
-  tmux(['respawn-pane', '-k', '-c', dir, '-t', paneId, claudeCmd(resumeId)]);
+  // No transcript to resume (it died before the first message): start over
+  // under a *fresh* id, and re-pin it. Reusing the old one would be rejected by
+  // claude if that pane did get as far as writing a transcript.
+  const sid = resumeId ? '' : randomUUID();
+  if (sid) setPaneOption(paneId, '@orc_sid', sid);
+  tmux(['respawn-pane', '-k', '-c', dir, '-t', paneId, claudeCmd(resumeId, sid)]);
 }

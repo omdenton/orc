@@ -20,11 +20,18 @@ tmux (on its own isolated socket — your normal tmux is untouched).
 
 | Icon | State | Meaning |
 |------|-------|---------|
-| spinner (cyan) | **running** | actively working right now (`esc to interrupt` on screen) |
+| spinner (cyan) | **running** | actively working right now (working footer on screen, or the transcript / sub-agent files advancing) |
 | `▶` (green) | **ready for input** | live and waiting on you |
 | `✗` (red) | **dead** | claude exited — select + Enter to restart |
 | `✓` (grey) | **idle** | a past session, not running — Enter starts it in the background |
 | `●` (yellow) | **active elsewhere** | a session being driven by a claude *outside* orc (another terminal/IDE) — not openable; wait for it to go idle, then resume it here |
+
+**Resume forks.** Newer Claude Code doesn't append to a transcript on
+`--resume` — it copies the history into a *new* session file (new id) and
+continues there. orc follows the fork: each conversation shows as **one** row
+(the newest file), stale ancestor files are hidden, saved names carry across,
+and a live pane's identity is re-pinned so restarting it resumes the newest
+file rather than a stale ancestor.
 
 ## Keys (in the left list)
 
@@ -105,9 +112,14 @@ the left pane), `orc __placeholder` (the empty-stage hint).
   session is ever destroyed.
 - **Identity** = a pane-scoped `@orc` option (Claude can't clobber it, unlike the
   pane title), so sessions are tracked reliably across swaps.
-- **Status** = read from each pane's `pane_current_command` + a `capture-pane`
-  scan for Claude's working footer.
+- **Status** = each pane's `pane_current_command` + a `capture-pane` scan for
+  Claude's working footer, OR'd with transcript freshness — including the
+  sub-agent / workflow files Claude writes under
+  `~/.claude/projects/<proj>/<session-id>/`, so a session waiting on sub-agents
+  still reads as running while its main transcript is quiet.
 
-The "working" marker is tunable in `src/tmux.ts` (`WORKING_MARKERS`).
+The screen markers are tunable in `src/tmux.ts` (`WORKING_MODE_LINE`,
+`WORKING_STATUS_LINE`, `BG_WAIT_FOOTER`) — they're coupled to Claude Code's
+UI wording, so re-verify them against a real session if status misreports.
 
 See `SPEC.md` for the full design and what's verified vs. needs a real terminal.
