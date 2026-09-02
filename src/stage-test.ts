@@ -1,6 +1,6 @@
 // Non-interactive validation of the stage swap logic + status classifier.
 // Uses sleep/counter stand-ins instead of real claude. Run: npm run stagetest
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   SOCKET,
   DASH_TAG,
@@ -13,8 +13,15 @@ import {
   capturePane,
   liveSessions,
   classifyCapture,
+  DASH_SESSION,
+  sidebarCols,
+  pinSidebar,
+  loadRatio,
+  displayFor,
+  SIDEBAR_RATIO,
+  SIDEBAR_FLOOR,
 } from './tmux.js';
-import { collapseForks, type Session } from './scanner.js';
+import { collapseForks, attentionMs, type Session } from './scanner.js';
 
 // HARD SAFETY GUARD. This test calls `kill-server`, which tears down the entire
 // tmux server on SOCKET — including a live orc dashboard and every session it
@@ -161,13 +168,72 @@ const metaChatIdle =
   `${'─'.repeat(80)}\n❯ \n${'─'.repeat(80)}\n${MODE_IDLE}\n  ⧉  orc · context`;
 check('marker phrases in transcript body -> still ready', classifyCapture('claude', metaChatIdle) === 'ready');
 
+console.log('sidebar ratio:');
+// The sidebar holds a SHARE of the terminal, not a column count — so a window
+// manager retiling around orc can't turn a comfortable 22% into 42% (or, as
+// tmux's own redistribution actually did, into ONE column).
+//
+// This drives a real attached client, because that's the only way the bug was
+// visible: `resize-pane` from a `client-resized` hook is undone by the relayout
+// that follows it, so a hand-fired resize "passes" while the live app breaks.
+// A control-mode client's size is settable, which makes a retile reproducible.
+{
+  raw(['select-window', '-t', dashWindow]);
+  const ratioPane = left.paneId;
+  const width = () => Number(displayFor(ratioPane, '#{pane_width}'));
+  const winWidth = () => Number(displayFor(ratioPane, '#{window_width}'));
+  // window-resized is a WINDOW-scoped hook, so it only shows under -gw
+  const hooks = () =>
+    `${raw(['show-hooks', '-g']).stdout ?? ''}\n${raw(['show-hooks', '-gw']).stdout ?? ''}`;
+  const ctl = spawn('tmux', ['-L', SOCKET, '-C', 'attach', '-t', DASH_SESSION], {
+    stdio: ['pipe', 'ignore', 'ignore'],
+  });
+  const setTerminal = (cols: number) => {
+    ctl.stdin.write(`refresh-client -C ${cols}x50\n`);
+    sleep(700);
+  };
+  sleep(800);
+
+  setTerminal(185);
+  pinSidebar(ratioPane, SIDEBAR_RATIO, winWidth());
+  check('185 cols -> 40 (the hand-tuned width)', width() === 40);
+  check('ratio round-trips through tmux', Math.abs(loadRatio() - SIDEBAR_RATIO) < 1e-9);
+  check('pin rides window-resized (client-resized runs pre-relayout)',
+    /window-resized\[0\] resize-pane/.test(hooks()) &&
+      !/client-resized\[0\] resize-pane/.test(hooks()));
+
+  for (const cols of [96, 240, 130]) {
+    setTerminal(cols);
+    const share = width() / winWidth();
+    check(`terminal at ${cols} cols keeps its ~22% share (got ${width()}/${winWidth()})`,
+      Math.abs(share - SIDEBAR_RATIO) < 0.03);
+  }
+
+  // a hand-tuned width (']' x3 from 40) becomes the new remembered share
+  setTerminal(185);
+  const tuned = sidebarCols(185, 52 / 185) / 185;
+  pinSidebar(ratioPane, tuned, winWidth());
+  check("']' x3 -> 52 cols", width() === 52);
+  setTerminal(100);
+  check(`tuned share survives the retile (want ~28, got ${width()})`, Math.abs(width() - 28) <= 1);
+
+  // rails
+  check('floor holds on a tiny terminal', sidebarCols(40, 0.05) === SIDEBAR_FLOOR);
+  check('ceiling leaves the stage 40%', sidebarCols(100, 0.9) === 60);
+  check('unknown terminal width -> 0 (no resize)', sidebarCols(0, SIDEBAR_RATIO) === 0);
+
+  ctl.stdin.end();
+  ctl.kill();
+  sleep(300);
+}
+
 console.log('fork collapse:');
 // `claude --resume` copies history into a NEW session file; collapseForks must
 // keep only the newest file of each conversation and map every ancestor to it.
 const fakeSession = (id: string, firstUuid: string, mtimeMs: number, isStub = false): Session =>
   ({ id, firstUuid, mtimeMs, path: '', cwd: '/x', title: id, lastPrompt: '', gitBranch: '',
-     permissionMode: '', messageCount: 0, lastActivityMs: mtimeMs, firstActivityMs: 1,
-     lastType: 'assistant', awaitingReply: false, isStub });
+     permissionMode: '', messageCount: 0, lastActivityMs: mtimeMs, lastUserMs: 0,
+     firstActivityMs: 1, lastType: 'assistant', awaitingReply: false, isStub });
 const a1 = fakeSession('a-old', 'uuid-a', 1000);
 const a2 = fakeSession('a-mid', 'uuid-a', 2000);
 const a3 = fakeSession('a-new', 'uuid-a', 3000);
@@ -184,6 +250,28 @@ check('turnless transcript keeps its own identity', view.canonical.get('c-empty'
 check('resume stub hidden from sidebar', !view.sessions.some((s) => s.id === 'a-stub'));
 check('resume stub still resolvable via canonical', view.canonical.get('a-stub')?.id === 'a-stub');
 check('collapsed list is newest-first', view.sessions[0].id === 'a-new');
+
+console.log('sidebar order:');
+// The list orders on "when did this last want me": a message I sent, or the
+// moment a session went quiet waiting on me. Work in flight earns nothing.
+{
+  const at = (id: string, lastUserMs: number, lastActivityMs: number): Session =>
+    ({ ...fakeSession(id, `u-${id}`, lastActivityMs), lastUserMs, lastActivityMs });
+  // t=100 I message A; t=200 I message B; A keeps working until t=300.
+  const a = at('a', 100, 300);
+  const b = at('b', 200, 200);
+  check('a busy session sorts on MY last message, not its churn',
+    attentionMs(a, true) === 100 && attentionMs(a, true) < attentionMs(b, false));
+  check('finishing lifts it above the one I messaged later',
+    attentionMs(a, false) === 300 && attentionMs(a, false) > attentionMs(b, false));
+  // …and it doesn't stay there: messaging B again at t=400 puts B back on top.
+  const b2 = at('b', 400, 400);
+  check("waiting isn't sticky — messaging another session retakes the top",
+    attentionMs(b2, true) > attentionMs(a, false));
+  check('a session I have never typed in falls back to when it began',
+    attentionMs({ ...at('c', 0, 900), firstActivityMs: 50 }, true) === 50);
+  check('no transcript -> no claim on the top', attentionMs(undefined, false) === 0);
+}
 
 raw(['kill-server']);
 console.log(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);

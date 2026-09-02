@@ -25,6 +25,10 @@ export interface Session {
    *  permission-mode / ai-title / last-prompt sidecar records — so it reflects
    *  "last time I messaged or claude was active", which is the sidebar order. */
   lastActivityMs: number;
+  /** ms timestamp of the last message *I* sent — a real human prompt, not a
+   *  tool result, meta record or sub-agent turn. This is the "I touched this"
+   *  signal the sidebar orders on; see attentionMs. 0 if I never typed. */
+  lastUserMs: number;
   /** ms timestamp of the FIRST conversational record — effectively when the
    *  session was created. 0 if the transcript has no timestamped turns. */
   firstActivityMs: number;
@@ -95,6 +99,7 @@ function parseFile(path: string, mtimeMs: number): Session {
   let lastRole = ''; // role of the last user/assistant record (ignores metadata lines)
   let firstUserText = '';
   let lastActivityMs = 0; // newest conversational-record timestamp
+  let lastUserMs = 0; // newest timestamp of a prompt I actually typed
   let firstActivityMs = 0; // oldest conversational-record timestamp
   let sawAiTitle = false;
 
@@ -137,9 +142,17 @@ function parseFile(path: string, mtimeMs: number): Session {
     }
     if (r.type === 'last-prompt') lastPrompt = r.lastPrompt || r.content || lastPrompt;
     if (r.type === 'permission-mode' && r.permissionMode) permissionMode = r.permissionMode;
-    if (!firstUserText && r.type === 'user' && r.message && !r.isMeta) {
+    if (r.type === 'user' && r.message && !r.isMeta && !r.isSidechain) {
+      // A real prompt, not a tool result (textFromContent finds no 'text' block
+      // in those), a slash-command echo, or a sub-agent's instructions.
       const t = textFromContent(r.message.content);
-      if (t && !isJunkText(t)) firstUserText = t;
+      if (t && !isJunkText(t)) {
+        if (!firstUserText) firstUserText = t;
+        if (typeof r.timestamp === 'string') {
+          const ts = Date.parse(r.timestamp);
+          if (ts > lastUserMs) lastUserMs = ts;
+        }
+      }
     }
   }
 
@@ -159,12 +172,36 @@ function parseFile(path: string, mtimeMs: number): Session {
     messageCount,
     mtimeMs,
     lastActivityMs: lastActivityMs || mtimeMs,
+    lastUserMs,
     firstActivityMs,
     lastType,
     firstUuid,
     awaitingReply: lastRole === 'user',
     isStub: sawAiTitle && lastRole === '',
   };
+}
+
+/**
+ * When a session last wanted my attention — the sidebar's sort key.
+ *
+ * Two things earn the top slot: a message I just sent, and a session going
+ * quiet because it's now waiting on me. Work in flight earns nothing, so a
+ * chatty background session can't churn its way above the one I'm actually
+ * talking to; it re-surfaces the moment it finishes and needs an answer.
+ *
+ * Neither is sticky: both are timestamps, so typing into another session
+ * simply gives that one a newer one, and whatever was waiting slides down
+ * without ever having been pinned.
+ */
+export function attentionMs(s: Session | undefined, busy: boolean): number {
+  if (!s) return 0;
+  // Busy: only my last message counts — its own activity is just noise until
+  // it stops. Fall back to when it started, so a session I've never typed in
+  // (resumed from history, driven from elsewhere) still has a sane place.
+  if (busy) return s.lastUserMs || s.firstActivityMs || s.lastActivityMs;
+  // Idle / ready / dead: whichever came last — my message, or the moment it
+  // fell quiet waiting for me.
+  return Math.max(s.lastUserMs, s.lastActivityMs);
 }
 
 // Sidecar activity: Claude Code now writes sub-agent transcripts and workflow

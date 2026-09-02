@@ -1,16 +1,15 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { render, Box, Text, useInput, useStdout } from 'ink';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import * as tmux from './tmux.js';
-import { scanSessions, canAdopt, collapseForks, type Session } from './scanner.js';
+import { scanSessions, canAdopt, collapseForks, attentionMs, type Session } from './scanner.js';
 import { loadNames, setName } from './names.js';
 
 const ORC_BIN = fileURLToPath(new URL('../bin/orc.mjs', import.meta.url));
 const NODE = process.execPath;
 const HOME = homedir();
 const POLL_MS = 1500;
-const LEFT_COLS = 46;
 
 const paneCmd = (sub: string) => `${tmux.shellQuote(NODE)} ${tmux.shellQuote(ORC_BIN)} ${sub}`;
 
@@ -38,13 +37,11 @@ function createDashboard() {
     .find((p) => p.session === tmux.DASH_SESSION && p.paneId !== left.paneId);
   if (ph) tmux.setPaneTag(ph.paneId, tmux.PLACEHOLDER_TAG);
 
-  // Pin the sidebar to a sane width, and re-pin it whenever the client resizes
-  // or attaches, so it never collapses or over-widens on smaller screens.
-  const leftWidth = Math.max(24, Math.min(LEFT_COLS, Math.floor(cols * 0.42)));
-  tmux.resizePaneWidth(left.paneId, leftWidth);
-  const pin = `resize-pane -t ${left.paneId} -x ${leftWidth}`;
-  tmux.setHook('client-resized', pin);
-  tmux.setHook('client-attached', pin);
+  // Pin the sidebar to its share of the terminal, and re-pin it whenever the
+  // client resizes or attaches, so it holds that proportion instead of a fixed
+  // column count that reads as a sliver on a wide screen and half the window on
+  // a narrow one.
+  tmux.pinSidebar(left.paneId, tmux.SIDEBAR_RATIO, cols);
 
   // cosmetics + focus keys (scoped to the orc socket, so your normal tmux is untouched)
   tmux.setGlobalOption('status', 'off');
@@ -123,6 +120,20 @@ function bootstrap() {
         }
         tmux.selectPane(dash.paneId);
       }
+      // Re-pin proportionally. A dashboard from an older orc (or one whose
+      // ratio was never stored) has a fixed-column pin — carry its current
+      // proportion over rather than resetting the width the user tuned, then
+      // let the client-attached hook apply it at the incoming terminal size.
+      const stored = Number(tmux.getGlobalOption(tmux.RATIO_OPT));
+      let ratio = stored > 0.05 && stored < 0.9 ? stored : 0;
+      if (!ratio) {
+        const [pw, ww] = tmux
+          .displayFor(dash.paneId, '#{pane_width} #{window_width}')
+          .split(' ')
+          .map(Number);
+        ratio = pw > 0 && ww > 0 ? pw / ww : tmux.SIDEBAR_RATIO;
+      }
+      tmux.pinSidebar(dash.paneId, ratio, tmux.clientWidth() || process.stdout.columns || 0);
     }
   }
 
@@ -166,9 +177,10 @@ interface Row {
   title: string;
   cwd: string;
   status: RowStatus;
-  /** sort key: transcript mtime (ms). Brand-new sessions with no transcript
-   *  yet fall back to "now" so they surface at the top. */
-  mtime: number;
+  /** sort key: when this session last wanted my attention (see attentionMs).
+   *  Brand-new sessions with no transcript yet fall back to "now" so they
+   *  surface at the top. */
+  attention: number;
   live?: tmux.LiveSession;
   historical?: Session;
 }
@@ -209,10 +221,15 @@ function liveStatus(captureStatus: tmux.Status, h?: Session): tmux.Status {
   return captureStatus;
 }
 
+/** Statuses where the session is working, not waiting on me. */
+const busy = (status: RowStatus): boolean => status === 'running' || status === 'external';
+
 // Row-key renames from the last buildRows pass (old key → new key), written
-// when a fork re-pins a live row's identity. The Dashboard applies these to
-// its selection (and an in-flight rename target) right after each refresh, so
-// the highlight rides across the rebind instead of snapping to the top.
+// whenever a row's identity is re-pinned: a fork rebinding a live row, or a
+// brand-new pane adopting the transcript it just wrote (paneId → transcript
+// id). The Dashboard applies these to its selection (and an in-flight rename
+// target) right after each refresh, so the highlight rides across the rebind
+// instead of snapping to the top.
 const keyAliases = new Map<string, string>();
 
 function buildRows(): Row[] {
@@ -270,6 +287,7 @@ function buildRows(): Row[] {
       // Unbound pane whose transcript another pane owns → key by pane id so
       // two rows can never collide on the same transcript key.
       const key = h?.id ?? (claimed.has(l.resumeId) ? l.paneId : l.resumeId);
+      const status = liveStatus(l.status, h);
       rows.push({
         // Row identity keys off the transcript id, not the pane id: it stays
         // the same across idle → live → idle transitions, so the selection
@@ -277,8 +295,8 @@ function buildRows(): Row[] {
         key,
         title: names[key] ?? h?.title ?? l.label ?? '(new session)',
         cwd: l.cwd,
-        status: liveStatus(l.status, h),
-        mtime: h?.lastActivityMs ?? Date.now(),
+        status,
+        attention: attentionMs(h, busy(status)) || Date.now(),
         live: l,
         historical: h,
       });
@@ -313,18 +331,23 @@ function buildRows(): Row[] {
       // user-chosen label over the transcript's derived title.
       const pinned = (names[h.id] ?? (customLabel || h.title)).slice(0, 40);
       tmux.setPaneTag(l.paneId, `s|${h.id}|${pinned}`);
+      // The row was keyed by pane id while it had no transcript; adoption flips
+      // the key to the transcript id. Record it, or the highlight (and a rename
+      // in progress) loses its target the moment the first message lands.
+      keyAliases.set(l.paneId, h.id);
     }
     const title =
       (h && names[h.id]) ||
       customLabel ||
       (h && h.title && h.title !== '(untitled)' ? shortLabel(h.title) : '') ||
       'new session';
+    const status = liveStatus(l.status, h);
     rows.push({
       key: h?.id ?? l.paneId,
       title,
       cwd: l.cwd,
-      status: liveStatus(l.status, h),
-      mtime: h?.lastActivityMs ?? Date.now(),
+      status,
+      attention: attentionMs(h, busy(status)) || Date.now(),
       live: l,
       historical: h,
     });
@@ -337,17 +360,18 @@ function buildRows(): Row[] {
       cwd: h.cwd,
       // Unowned but being written by a claude outside orc → not safe to resume.
       status: transcriptBusy(h.id, h.mtimeMs, h.awaitingReply) ? 'external' : 'idle',
-      mtime: h.lastActivityMs,
+      attention: attentionMs(h, false),
       historical: h,
     });
   }
 
-  // Most-recently-active first, by last conversational turn (last message I sent
-  // or last assistant/sub-agent activity) — NOT raw file mtime, which a bare
-  // `--resume` on open would bump, floating a just-opened-but-untouched session
-  // above one I actually messaged more recently. Brand-new sessions sort by
-  // Date.now() (set above) so they surface at the top until their first turn.
-  rows.sort((a, b) => b.mtime - a.mtime);
+  // Ordered by whoever wants me most recently: the session I last typed in, or
+  // one that has gone quiet waiting on me (see attentionMs). Deliberately NOT
+  // raw activity — a background session churning through a long task would
+  // otherwise sit permanently above the conversation I'm actually having, and
+  // never move. Brand-new sessions sort by Date.now() (set above) so they
+  // surface at the top until their first turn.
+  rows.sort((a, b) => b.attention - a.attention);
   return rows;
 }
 
@@ -468,15 +492,29 @@ function Dashboard() {
     cols: stdout?.columns ?? 40,
     rows: stdout?.rows ?? 24,
   });
+  // Sidebar share of the terminal. Read from tmux once (it outlives a UI
+  // respawn), then owned here: `[` / `]` retune it and every resize re-derives
+  // the column count from it.
+  const [ratio, setRatio] = useState(tmux.loadRatio);
+  const ratioRef = useRef(ratio);
+  ratioRef.current = ratio;
   useEffect(() => {
     if (!stdout) return;
-    const onResize = () => setDims({ cols: stdout.columns, rows: stdout.rows });
+    const onResize = () => {
+      setDims({ cols: stdout.columns, rows: stdout.rows });
+      // The client-resized hook has already applied the percentage pin; this
+      // applies the clamped exact width (a no-op in the normal range, and the
+      // floor/ceiling at the extremes). stdout.columns is this PANE's width, so
+      // the terminal width has to come from tmux.
+      const want = tmux.sidebarCols(tmux.clientWidth(), ratioRef.current);
+      if (want && want !== stdout.columns) tmux.resizePaneWidth(myPaneId, want);
+    };
     stdout.on('resize', onResize);
     onResize();
     return () => {
       stdout.off('resize', onResize);
     };
-  }, [stdout]);
+  }, [stdout, myPaneId]);
 
   const visibleRows = Math.max(3, dims.rows - CHROME_LINES);
   const titleWidth = Math.max(8, dims.cols - 5); // prefix(2) + glyph(1) + space(1) + margin
@@ -495,6 +533,11 @@ function Dashboard() {
   // transcript id for idle rows), NOT its slot — so the list can re-sort under
   // the cursor without the highlight drifting onto a different session.
   const [selectedKey, setSelectedKey] = useState('');
+  // Pane currently on the stage — the session the user actually has open.
+  // Sampled once per poll (not per render: currentStage() shells out to tmux)
+  // and used as the fallback anchor for the highlight, so a re-sort can never
+  // float it onto whatever session happened to finish most recently.
+  const [stagePaneId, setStagePaneId] = useState('');
   const [query, setQuery] = useState('');
   const [typing, setTyping] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -506,12 +549,25 @@ function Dashboard() {
   const [help, setHelp] = useState(false);
 
   const refresh = useCallback(() => {
-    setRows(buildRows());
-    // A fork rebind renames row keys (old transcript id → new) — follow it, so
-    // the highlight / an in-flight rename stay on the same session.
-    setSelectedKey((k) => keyAliases.get(k) ?? k);
+    const next = buildRows();
+    setRows(next);
+    const stage = currentStage()?.paneId ?? '';
+    setStagePaneId(stage);
+    // A fork rebind (or a new session adopting its transcript) renames row keys
+    // — follow it, so the highlight / an in-flight rename stay on the same
+    // session.
+    setSelectedKey((k) => {
+      const key = keyAliases.get(k) ?? k;
+      if (next.some((r) => r.key === key)) return key;
+      // No row owns the selection: first paint, or the session it pointed at is
+      // gone. Anchor it explicitly — to the session on the stage, else the top
+      // row — rather than leaving it dangling, which resolves to slot 0 afresh
+      // every poll and so rides the re-sort onto a different session.
+      const staged = stage ? next.find((r) => r.live?.paneId === stage) : undefined;
+      return staged?.key ?? next[0]?.key ?? '';
+    });
     setRenameKey((k) => keyAliases.get(k) ?? k);
-  }, []);
+  }, [currentStage]);
 
   useEffect(() => {
     refresh();
@@ -533,9 +589,12 @@ function Dashboard() {
     ? rows.filter((r) => (r.title + ' ' + r.cwd).toLowerCase().includes(query.toLowerCase()))
     : rows;
   // Re-derive the cursor position from the selected identity every render. If
-  // the selected row vanished (killed, or filtered out) fall back to the top.
+  // the selected row vanished (killed) or a filter hid it, fall back to the
+  // session on the stage — the one the user has open — and only then to the
+  // top, which the sort keeps handing to whatever wanted me last.
   const sel = filtered.findIndex((r) => r.key === selectedKey);
-  const clamped = sel >= 0 ? sel : 0;
+  const stageIdx = stagePaneId ? filtered.findIndex((r) => r.live?.paneId === stagePaneId) : -1;
+  const clamped = sel >= 0 ? sel : stageIdx >= 0 ? stageIdx : 0;
   const selected = filtered[clamped];
 
   const showOnStage = useCallback(
@@ -547,8 +606,8 @@ function Dashboard() {
         // Nothing to swap against — splice the chosen pane back in as a fresh
         // right-hand split, then restore the sidebar from the 50/50 default.
         tmux.joinPaneRight(paneId, myPaneId);
-        const cols = tmux.clientWidth();
-        if (cols) tmux.resizePaneWidth(myPaneId, Math.max(24, Math.min(LEFT_COLS, Math.floor(cols * 0.42))));
+        const w = tmux.sidebarCols(tmux.clientWidth(), ratioRef.current);
+        if (w) tmux.resizePaneWidth(myPaneId, w);
       } else if (paneId !== stage.paneId) {
         tmux.swapPane(paneId, stage.paneId);
       }
@@ -600,12 +659,17 @@ function Dashboard() {
 
   const adjustSidebar = useCallback(
     (delta: number) => {
-      const w = Math.max(20, Math.min(100, dims.cols + delta));
-      tmux.resizePaneWidth(myPaneId, w);
-      // keep the resize/attach pin in sync so the chosen width persists
-      const pin = `resize-pane -t ${myPaneId} -x ${w}`;
-      tmux.setHook('client-resized', pin);
-      tmux.setHook('client-attached', pin);
+      // Nudge by columns (what the user sees), store as a ratio (what survives
+      // a resize): the width you tune here becomes the share the sidebar keeps
+      // when the terminal changes size.
+      const cols = tmux.clientWidth() || dims.cols;
+      // Derive the ratio from the width that actually gets applied (post-rails),
+      // so holding `]` past the ceiling can't inflate a stored ratio that then
+      // needs several `[` presses to visibly undo.
+      const w = tmux.sidebarCols(cols, Math.max(20, dims.cols + delta) / cols);
+      const next = w / cols;
+      setRatio(next);
+      tmux.pinSidebar(myPaneId, next, cols);
     },
     [dims.cols, myPaneId],
   );
@@ -629,6 +693,9 @@ function Dashboard() {
   const killSelected = useCallback(() => {
     if (!selected?.live) return;
     const victim = selected.live.paneId;
+    // Hand the highlight to a neighbour before the row disappears, so it lands
+    // next to what was killed instead of falling back to the top of the list.
+    setSelectedKey(filtered[clamped + 1]?.key ?? filtered[clamped - 1]?.key ?? '');
     if (currentStage()?.paneId === victim) {
       const ph = tmux.paneByTag(tmux.PLACEHOLDER_TAG);
       if (ph) showOnStage(ph.paneId);
@@ -638,7 +705,7 @@ function Dashboard() {
     // pull focus back so j/k/x keep working after a kill.
     tmux.selectPane(myPaneId);
     refresh();
-  }, [selected, currentStage, showOnStage, refresh, myPaneId]);
+  }, [selected, filtered, clamped, currentStage, showOnStage, refresh, myPaneId]);
 
   useInput((input, key) => {
     // text-entry modes capture everything; Ctrl-C / Esc cancel them

@@ -99,6 +99,12 @@ export function clientWidth(): number {
   return Number(tmux(['display-message', '-p', '#{client_width}']).stdout) || 0;
 }
 
+/** Evaluate a tmux format against a target (pane/window); '' if unavailable. */
+export function displayFor(target: string, fmt: string): string {
+  const r = tmux(['display-message', '-p', '-t', target, fmt]);
+  return r.code === 0 ? r.stdout : '';
+}
+
 /** The pane this process is running in. Uses $TMUX_PANE (set by tmux in every
  *  pane) so it resolves even when no client is attached. */
 export function selfPaneId(): string {
@@ -186,6 +192,61 @@ export function resizePaneWidth(paneId: string, cols: number): void {
   tmux(['resize-pane', '-t', paneId, '-x', String(cols)]);
 }
 
+// ---------------------------------------------------------------------------
+// Sidebar geometry
+// ---------------------------------------------------------------------------
+
+// The sidebar is sized as a FRACTION of the terminal, not a fixed column count.
+// A fixed count is what made the layout lurch when the window manager retiles
+// around orc: 40 cols is a comfortable ~22% of a 185-col full-screen terminal,
+// but 42% of the same terminal at half-screen width. The default below is that
+// hand-tuned full-screen width expressed as a proportion, so every resize keeps
+// the proportion. `[` / `]` retune it, and it is remembered as a ratio rather
+// than a width (see RATIO_OPT).
+export const SIDEBAR_RATIO = 40 / 185; // ≈ 0.216
+// Safety rails, not policy: the ratio decides the width, these only stop it
+// collapsing to nothing or crowding the stage out at extreme terminal sizes.
+export const SIDEBAR_FLOOR = 12;
+export const SIDEBAR_CEIL_FRAC = 0.6;
+/** tmux user option holding the live ratio, so it survives a UI respawn. */
+export const RATIO_OPT = '@orc_ratio';
+
+/** Sidebar width in columns for a terminal `clientCols` wide (0 if unknown). */
+export function sidebarCols(clientCols: number, ratio: number): number {
+  if (!clientCols) return 0;
+  const ceil = Math.max(SIDEBAR_FLOOR, Math.floor(clientCols * SIDEBAR_CEIL_FRAC));
+  return Math.max(SIDEBAR_FLOOR, Math.min(ceil, Math.round(clientCols * ratio)));
+}
+
+/** The remembered ratio, or the default when unset / out of sane bounds. */
+export function loadRatio(): number {
+  const v = Number(getGlobalOption(RATIO_OPT));
+  return v > 0.05 && v < 0.9 ? v : SIDEBAR_RATIO;
+}
+
+/**
+ * Pin the sidebar to `ratio` of the terminal: remember it, apply it now, and
+ * re-pin whenever the terminal changes size. The hooks use tmux's own
+ * percentage form, so the proportion holds even while the UI is busy or has
+ * crashed; the UI additionally applies the railed exact width on its SIGWINCH.
+ *
+ * The hook is `window-resized`, NOT `client-resized`: client-resized runs
+ * BEFORE tmux relays out the window, so anything it resizes is immediately
+ * undone by the relayout — measured identical to having no hook at all, which
+ * is why a terminal resize used to crush the sidebar to a single column (tmux's
+ * own redistribution) no matter what width was pinned. window-resized runs
+ * after the new geometry settles, where a resize sticks.
+ */
+export function pinSidebar(paneId: string, ratio: number, clientCols: number): void {
+  setGlobalOption(RATIO_OPT, String(ratio));
+  const w = sidebarCols(clientCols, ratio);
+  if (w) resizePaneWidth(paneId, w);
+  const pin = `resize-pane -t ${paneId} -x ${Math.round(ratio * 100)}%`;
+  setHook('window-resized', pin);
+  setHook('client-attached', pin); // attaching at the same size doesn't resize
+  unsetHook('client-resized'); // clear the ineffective pin older orcs left set
+}
+
 export function bindRootKey(key: string, ...cmd: string[]): void {
   tmux(['bind-key', '-n', key, ...cmd]);
 }
@@ -204,12 +265,22 @@ export function setGlobalOption(opt: string, val: string): void {
   tmux(['set-option', '-g', opt, val]);
 }
 
+/** Read a global option (including @user options); '' if unset. */
+export function getGlobalOption(opt: string): string {
+  const r = tmux(['show-options', '-gqv', opt]);
+  return r.code === 0 ? r.stdout : '';
+}
+
 export function setWindowOption(opt: string, val: string): void {
   tmux(['set-window-option', '-g', opt, val]);
 }
 
 export function setHook(hook: string, command: string): void {
   tmux(['set-hook', '-g', hook, command]);
+}
+
+export function unsetHook(hook: string): void {
+  tmux(['set-hook', '-gu', hook]);
 }
 
 export function selectLayout(name: string): void {

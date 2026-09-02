@@ -33,11 +33,21 @@ continues there. orc follows the fork: each conversation shows as **one** row
 and a live pane's identity is re-pinned so restarting it resumes the newest
 file rather than a stale ancestor.
 
+## Order
+
+The list is sorted by **what last wanted you**: the session you most recently
+typed in, or one that has gone quiet waiting on your input. Work in flight
+doesn't count — a background session churning through a long task holds its
+place instead of shoving the conversation you're actually having down the list,
+and it re-surfaces the moment it finishes and needs an answer. Nothing is
+pinned: send a message somewhere else and that session takes the top, while
+whatever was waiting slides down.
+
 ## Keys (in the left list)
 
 `↑↓`/`jk` move · `Enter` open (starts idle ones) → stage + focus · `Tab` focus
 the session · `n` **name/rename** the highlighted chat · `N` new session · `x`
-kill · `[` / `]` shrink/grow the sidebar (persists across resizes) · `/` filter ·
+kill · `[` / `]` shrink/grow the sidebar (see below) · `/` filter ·
 `r` refresh · `?` **help** (a floating shortcut cheatsheet; `Esc` closes).
 
 A brand-new session (`N`) is labelled `new session` only until you send your
@@ -56,8 +66,15 @@ transcript id, so they **persist across restarts**. Renaming a brand-new session
 - `d` — **detach only**: leave every session running in the background; re-run
   `orc` to reattach right where you left off.
 
+**Sidebar width** is a *share* of the terminal (~22% by default), not a fixed
+column count — so when your window manager retiles around orc, the sidebar keeps
+its proportion instead of swelling to half the window on a narrow terminal and
+shrinking to a sliver on a wide one. `[` / `]` nudge it by a few columns and the
+width you land on becomes the new share, remembered for every later resize.
+
 You can also **drag the pane divider with the mouse** to resize (mouse mode is
-on) — though a later terminal resize snaps back to the `[`/`]` width.
+on) — though a drag isn't recorded as a new share, so a later terminal resize
+snaps back to the `[`/`]` proportion.
 
 **Move focus back to the list** from inside a session: `Alt-←` (or `Alt-h`).
 Forward: `Alt-→` / `Alt-l`. Native tmux `Ctrl-b ←/→`, and `Ctrl-b z` to zoom the
