@@ -22,8 +22,21 @@ export const DASH_TAG = '__dash__';
 export const PLACEHOLDER_TAG = '__placeholder__';
 const SESSION_TAG_PREFIX = 's|'; // s|<resumeId>|<label>
 
+// tmux sanitises non-printable characters in format output (tabs become '_')
+// whenever the *client* runs without a UTF-8 locale, and renders non-ASCII in
+// attached panes the same way. That is the norm over SSH, where LANG is rarely
+// forwarded. Our pane parser splits on tabs, so give every tmux client we spawn
+// a UTF-8 locale when the environment has none. A server started by such a
+// client inherits it too, so hosted sessions render correctly as well.
+export const TMUX_ENV: NodeJS.ProcessEnv = (() => {
+  const e = process.env;
+  const loc = e.LC_ALL || e.LC_CTYPE || e.LANG || '';
+  if (/utf-?8/i.test(loc)) return e;
+  return { ...e, LANG: 'C.UTF-8', ...(e.LC_ALL ? { LC_ALL: 'C.UTF-8' } : {}) };
+})();
+
 function tmux(args: string[]) {
-  const r = spawnSync('tmux', ['-L', SOCKET, ...args], { encoding: 'utf8' });
+  const r = spawnSync('tmux', ['-L', SOCKET, ...args], { encoding: 'utf8', env: TMUX_ENV });
   return {
     code: r.status ?? 1,
     stdout: (r.stdout ?? '').replace(/\n$/, ''),
@@ -176,6 +189,10 @@ export function killServer(): void {
   tmux(['kill-server']);
 }
 
+export function killSession(name: string): void {
+  tmux(['kill-session', '-t', name]);
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard bootstrap helpers
 // ---------------------------------------------------------------------------
@@ -289,7 +306,7 @@ export function selectLayout(name: string): void {
 
 /** Attach to the dashboard, blocking until the client detaches. */
 export function attachBlocking(): number {
-  const env = { ...process.env };
+  const env = { ...TMUX_ENV }; // UTF-8 locale, so the client renders hosted panes properly
   delete env.TMUX; // allow attaching even when launched from inside another tmux
   const r = spawnSync('tmux', ['-L', SOCKET, 'attach-session', '-t', DASH_SESSION], {
     stdio: 'inherit',

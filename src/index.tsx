@@ -18,8 +18,9 @@ const paneCmd = (sub: string) => `${tmux.shellQuote(NODE)} ${tmux.shellQuote(ORC
 // then attach. Re-running orc just reattaches.
 // ===========================================================================
 function createDashboard() {
-  const cols = process.stdout.columns ?? 200;
-  const rows = process.stdout.rows ?? 50;
+  // `||` not `??`: a pty with no size yet reports 0, which tmux rejects.
+  const cols = process.stdout.columns || 200;
+  const rows = process.stdout.rows || 50;
 
   tmux.newDashboard(cols, rows, paneCmd('__pane'));
   const left = tmux.listPanes().find((p) => p.session === tmux.DASH_SESSION);
@@ -53,9 +54,14 @@ function createDashboard() {
   // copy mode, so a plain drag actually copies. (Shift+drag still bypasses tmux
   // entirely for native Alacritty selection / link-clicking.) set-clipboard on
   // also lets the hosted claude sessions write your clipboard via OSC52.
+  //
+  // Over SSH there is no Wayland display in the tmux server's environment, so
+  // wl-copy would just error; skip it there and rely on set-clipboard, which
+  // sends the same selection to the attached client's terminal as OSC52.
+  const COPY_PIPE = '[ -n "$WAYLAND_DISPLAY" ] && command -v wl-copy >/dev/null 2>&1 && exec wl-copy; cat >/dev/null';
   tmux.setGlobalOption('set-clipboard', 'on');
-  tmux.bindKeyInTable('copy-mode-vi', 'MouseDragEnd1Pane', 'send-keys', '-X', 'copy-pipe-and-cancel', 'wl-copy');
-  tmux.bindKeyInTable('copy-mode', 'MouseDragEnd1Pane', 'send-keys', '-X', 'copy-pipe-and-cancel', 'wl-copy');
+  tmux.bindKeyInTable('copy-mode-vi', 'MouseDragEnd1Pane', 'send-keys', '-X', 'copy-pipe-and-cancel', COPY_PIPE);
+  tmux.bindKeyInTable('copy-mode', 'MouseDragEnd1Pane', 'send-keys', '-X', 'copy-pipe-and-cancel', COPY_PIPE);
   tmux.bindRootKey('M-h', 'select-pane', '-L');
   tmux.bindRootKey('M-l', 'select-pane', '-R');
   tmux.bindRootKey('M-Left', 'select-pane', '-L');
@@ -89,8 +95,9 @@ function bootstrap() {
     // A dashboard exists — make sure its UI pane is healthy before attaching.
     const dash = tmux.listPanes().find((p) => p.tag === tmux.DASH_TAG);
     if (!dash) {
-      // Layout is gone (severe crash). Rebuild fresh; sessions are resumable from history.
-      tmux.killServer();
+      // Layout is gone (severe crash). Rebuild just the dashboard session;
+      // hosted claude sessions elsewhere on this server stay live.
+      tmux.killSession(tmux.DASH_SESSION);
       createDashboard();
     } else if (dash.dead || dash.cmd !== 'node') {
       // UI crashed but the hosted sessions are intact — restart just the UI pane.
