@@ -52,6 +52,9 @@ kill · `[` / `]` shrink/grow the sidebar (see below) · `/` filter ·
 
 A brand-new session (`N`) is labelled `new session` only until you send your
 first message — then it auto-renames to a short name derived from that prompt.
+A session whose first prompt is a slash command (`/morning-digest`, `/news-digest`,
+a scheduled `claude -p "/x"` run) is titled `<command> <date>` instead —
+`morning-digest 2026-09-09` — so each day's run is one dated row with no naming.
 Press `n` any time to override it with your own name.
 
 **Renaming** (`n`): type the new name and `Enter` (empty = cancel, `Ctrl-U`

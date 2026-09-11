@@ -77,6 +77,29 @@ function isJunkText(s: string): boolean {
   return false;
 }
 
+/** Sessions whose FIRST prompt is a slash command (`/morning-digest`,
+ *  `/news-digest`, a scheduled `claude -p "/x"` run) get a deterministic
+ *  dated title — "morning-digest 2026-09-09" — instead of whatever
+ *  summary Claude generates. One row per day, no hand-naming, and no
+ *  collisions between weeks. Beats aiTitle; a saved name still wins. */
+const BUILTIN_COMMANDS = new Set([
+  'model', 'mcp', 'clear', 'help', 'config', 'compact', 'cost', 'status', 'login',
+  'logout', 'resume', 'doctor', 'permissions', 'memory', 'agents', 'hooks', 'vim',
+  'terminal-setup', 'release-notes', 'bug', 'feedback', 'export', 'context', 'tasks',
+]);
+export function slashCommandTitle(firstPromptText: string, tsMs: number): string {
+  const text = firstPromptText || '';
+  const m = /<command-name>\/?([\w][\w:.-]*)<\/command-name>/.exec(text);
+  if (!m || !tsMs) return '';
+  // Built-in CLI commands (/model, /mcp …) open a session but say nothing about
+  // what it's for — they echo with <command-args>, skills don't. Leave those to
+  // the normal ai-title path.
+  if (BUILTIN_COMMANDS.has(m[1]) || /<command-args>/.test(text)) return '';
+  const d = new Date(tsMs);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${m[1]} ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 function textFromContent(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -102,6 +125,8 @@ function parseFile(path: string, mtimeMs: number): Session {
   let lastUserMs = 0; // newest timestamp of a prompt I actually typed
   let firstActivityMs = 0; // oldest conversational-record timestamp
   let sawAiTitle = false;
+  let slashTitle = '';
+  let sawFirstPrompt = false; // any real user prompt seen yet (junk or not)
 
   let text = '';
   try {
@@ -146,6 +171,10 @@ function parseFile(path: string, mtimeMs: number): Session {
       // A real prompt, not a tool result (textFromContent finds no 'text' block
       // in those), a slash-command echo, or a sub-agent's instructions.
       const t = textFromContent(r.message.content);
+      if (t && !sawFirstPrompt) {
+        sawFirstPrompt = true;
+        slashTitle = slashCommandTitle(t, typeof r.timestamp === 'string' ? Date.parse(r.timestamp) : 0);
+      }
       if (t && !isJunkText(t)) {
         if (!firstUserText) firstUserText = t;
         if (typeof r.timestamp === 'string') {
@@ -156,6 +185,7 @@ function parseFile(path: string, mtimeMs: number): Session {
     }
   }
 
+  if (slashTitle) title = slashTitle;
   if (!title) {
     const cleanLast = lastPrompt && !isJunkText(lastPrompt) ? lastPrompt : '';
     title = truncate(firstUserText || cleanLast || '(untitled)', 60);

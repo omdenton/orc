@@ -21,7 +21,7 @@ import {
   SIDEBAR_RATIO,
   SIDEBAR_FLOOR,
 } from './tmux.js';
-import { collapseForks, attentionMs, type Session } from './scanner.js';
+import { collapseForks, attentionMs, slashCommandTitle, type Session } from './scanner.js';
 
 // HARD SAFETY GUARD. This test calls `kill-server`, which tears down the entire
 // tmux server on SOCKET — including a live orc dashboard and every session it
@@ -226,6 +226,17 @@ console.log('sidebar ratio:');
   ctl.kill();
   sleep(300);
 }
+
+console.log('slash-command titles:');
+// A session whose first prompt is a slash command is titled "<command> <date>".
+const t0 = new Date(2026, 8, 9, 9, 41).getTime(); // local 2026-09-09
+check('slash command -> dated title',
+  slashCommandTitle('<command-message>morning-digest</command-message>\n<command-name>/morning-digest</command-name>', t0) === 'morning-digest 2026-09-09');
+check('plain prompt -> no title', slashCommandTitle('fix the failing test', t0) === '');
+check('no timestamp -> no title', slashCommandTitle('<command-name>/news-digest</command-name>', 0) === '');
+check('built-in /model -> no title',
+  slashCommandTitle('<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>', t0) === '');
+check('namespaced command keeps its name', slashCommandTitle('<command-name>/plugin:skill</command-name>', t0) === 'plugin:skill 2026-09-09');
 
 console.log('fork collapse:');
 // `claude --resume` copies history into a NEW session file; collapseForks must
