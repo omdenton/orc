@@ -108,6 +108,21 @@ assert('no entrypoint field -> turns still counted', noField.turns === 4);
   assert('sidechain turns counted, metadata records not', parseFile(path, Date.now()).turns === 2);
 }
 
+// An explicit empty `entrypoint` on the first record that carries the field
+// still wins: a later record must not overwrite it (first-wins is about which
+// record spoke first, not about which value is truthy).
+{
+  const path = join(dir, 'empty-entrypoint-first.jsonl');
+  writeFileSync(
+    path,
+    [
+      JSON.stringify(userRec('go', '', '/home/denton')),
+      JSON.stringify(assistantRec('sdk-cli', '/home/denton')),
+    ].join('\n') + '\n',
+  );
+  assert("first record's empty entrypoint is not overwritten", parseFile(path, Date.now()).entrypoint === '');
+}
+
 // --- isHidden ---------------------------------------------------------------
 console.log('isHidden rule:');
 const NO_NAMES: Record<string, string> = {};
@@ -119,11 +134,13 @@ assert('an empty saved name does not', isHidden(probe, { [probe.id]: '' }) === t
 assert('cli session -> shown', isHidden(interactive, NO_NAMES) === false);
 assert("no entrypoint field -> shown", isHidden(noField, NO_NAMES) === false);
 
-// The turn threshold, both sides of the boundary.
-const long = fixture('long-probe', { entrypoint: 'sdk-cli', turns: HIDE_HEADLESS_TURNS });
-const short = fixture('short-probe', { entrypoint: 'sdk-cli', turns: HIDE_HEADLESS_TURNS - 1 });
-assert(`sdk-cli with ${HIDE_HEADLESS_TURNS} turns -> shown`, isHidden(long, NO_NAMES) === false);
-assert(`sdk-cli with ${HIDE_HEADLESS_TURNS - 1} turns -> hidden`, isHidden(short, NO_NAMES) === true);
+// The turn threshold. The spec fixes the value, so pin the literal — deriving
+// the fixtures from the constant would only pin "the boundary is exclusive".
+assert('HIDE_HEADLESS_TURNS is 20', HIDE_HEADLESS_TURNS === 20);
+const long = fixture('long-probe', { entrypoint: 'sdk-cli', turns: 20 });
+const short = fixture('short-probe', { entrypoint: 'sdk-cli', turns: 19 });
+assert('sdk-cli with 20 turns -> shown', isHidden(long, NO_NAMES) === false);
+assert('sdk-cli with 19 turns -> hidden', isHidden(short, NO_NAMES) === true);
 
 // Scratchpad cwds are throwaway whatever launched them.
 const scratch = fixture('scratch', {
@@ -135,6 +152,13 @@ assert('cli session in a /tmp/claude- scratchpad -> hidden', isHidden(scratch, N
 assert('…unless it has a saved name', isHidden(scratch, { [scratch.id]: 'mine' }) === false);
 const nearMiss = fixture('near-miss', { entrypoint: 'cli', turns: 4, cwd: '/tmp/claude' });
 assert("cwd '/tmp/claude' (no dash) -> shown", isHidden(nearMiss, NO_NAMES) === false);
+// The prefix has to be at the start: a cwd that merely contains it is real work.
+const midPath = fixture('mid-path', {
+  entrypoint: 'cli',
+  turns: 4,
+  cwd: '/home/denton/tmp/claude-x',
+});
+assert("'/tmp/claude-' mid-path, not at the start -> shown", isHidden(midPath, NO_NAMES) === false);
 
 rmSync(dir, { recursive: true, force: true });
 

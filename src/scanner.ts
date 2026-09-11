@@ -124,6 +124,8 @@ export function parseFile(path: string, mtimeMs: number): Session {
   const id = path.split('/').pop()!.replace(/\.jsonl$/, '');
   let cwd = '';
   let entrypoint = '';
+  let sawEntrypoint = false; // tracked apart from the value: the first record
+  // carrying the field wins even when it carries an empty string
   let turns = 0;
   let title = '';
   let lastPrompt = '';
@@ -171,7 +173,10 @@ export function parseFile(path: string, mtimeMs: number): Session {
       }
     }
     if (!cwd && typeof r.cwd === 'string') cwd = r.cwd;
-    if (!entrypoint && typeof r.entrypoint === 'string') entrypoint = r.entrypoint;
+    if (!sawEntrypoint && typeof r.entrypoint === 'string') {
+      entrypoint = r.entrypoint;
+      sawEntrypoint = true;
+    }
     if (typeof r.gitBranch === 'string') gitBranch = r.gitBranch;
     if (typeof r.messageCount === 'number' && r.messageCount > messageCount) {
       messageCount = r.messageCount;
