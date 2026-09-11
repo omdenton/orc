@@ -9,7 +9,8 @@
   "scripts": {
     "start": "tsx src/index.tsx",
     "dev": "tsx watch src/index.tsx",
-    "stagetest": "ORC_SOCKET=orc-test tsx src/stage-test.ts"
+    "stagetest": "ORC_SOCKET=orc-test tsx src/stage-test.ts",
+    "scannertest": "tsx src/scanner-test.ts"
   },
   "dependencies": {
     "ink": "^5.0.1",

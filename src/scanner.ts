@@ -51,6 +51,17 @@ export interface Session {
    *  duplicate of its parent. (A genuinely new session can't look like this —
    *  titles are only generated after the first exchange.) */
   isStub: boolean;
+  /** how this claude was launched, off the first record that carries the field:
+   *  `cli` for an interactive terminal session, `sdk-cli` for a headless
+   *  `claude -p` run. '' when no record carries it. See isHidden. */
+  entrypoint: string;
+  /** number of conversational records (user/assistant), sidechain included —
+   *  a size signal isHidden uses to tell a one-shot probe from real work. */
+  turns: number;
+  /** true when the title came from slashCommandTitle — i.e. the first prompt
+   *  was a slash command. Marks the scheduled runs worth keeping (the 04:00
+   *  digest) apart from the headless probes that aren't. */
+  slashTitled: boolean;
 }
 
 interface CacheEntry {
@@ -109,9 +120,11 @@ function textFromContent(content: unknown): string {
   return '';
 }
 
-function parseFile(path: string, mtimeMs: number): Session {
+export function parseFile(path: string, mtimeMs: number): Session {
   const id = path.split('/').pop()!.replace(/\.jsonl$/, '');
   let cwd = '';
+  let entrypoint = '';
+  let turns = 0;
   let title = '';
   let lastPrompt = '';
   let gitBranch = '';
@@ -146,6 +159,7 @@ function parseFile(path: string, mtimeMs: number): Session {
     if (r.type) lastType = r.type;
     if (r.type === 'user' || r.type === 'assistant') {
       lastRole = r.type;
+      turns++; // sidechain turns count: a probe's sub-agent work is still work
       if (!firstUuid && typeof r.uuid === 'string') firstUuid = r.uuid;
       // Track the newest turn timestamp. Sub-agent (sidechain) turns count too —
       // they mean the session is actively working. Metadata records carry no
@@ -157,6 +171,7 @@ function parseFile(path: string, mtimeMs: number): Session {
       }
     }
     if (!cwd && typeof r.cwd === 'string') cwd = r.cwd;
+    if (!entrypoint && typeof r.entrypoint === 'string') entrypoint = r.entrypoint;
     if (typeof r.gitBranch === 'string') gitBranch = r.gitBranch;
     if (typeof r.messageCount === 'number' && r.messageCount > messageCount) {
       messageCount = r.messageCount;
@@ -208,7 +223,34 @@ function parseFile(path: string, mtimeMs: number): Session {
     firstUuid,
     awaitingReply: lastRole === 'user',
     isStub: sawAiTitle && lastRole === '',
+    entrypoint,
+    turns,
+    slashTitled: !!slashTitle,
   };
+}
+
+/** Below this many turns a headless (`claude -p`) run is treated as a one-shot
+ *  probe rather than real work. Orchestrator permission probes run 2–6 turns;
+ *  a scheduled job that genuinely does something runs well past this. */
+export const HIDE_HEADLESS_TURNS = 20;
+
+/**
+ * Should this session be kept out of the sidebar's history rows?
+ *
+ * Drones verifying permission rules fire off `claude -p` probes by the dozen
+ * and each one writes its own transcript, burying the real sessions. They're
+ * distinguishable: `entrypoint` is `sdk-cli`, the run is short, and no slash
+ * command named it. Scheduled jobs worth seeing (the 04:00 digest) are also
+ * `sdk-cli` but ARE slash-titled, so they survive. Scratchpad cwds are junk by
+ * construction. A saved name beats every rule — naming a session is the user
+ * saying it matters.
+ *
+ * History rows only: index.tsx never hides a session live in an orc pane.
+ */
+export function isHidden(s: Session, names: Record<string, string>): boolean {
+  if (names[s.id]) return false;
+  if (s.cwd.startsWith('/tmp/claude-')) return true;
+  return s.entrypoint === 'sdk-cli' && !s.slashTitled && s.turns < HIDE_HEADLESS_TURNS;
 }
 
 /**

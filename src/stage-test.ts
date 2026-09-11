@@ -244,7 +244,8 @@ console.log('fork collapse:');
 const fakeSession = (id: string, firstUuid: string, mtimeMs: number, isStub = false): Session =>
   ({ id, firstUuid, mtimeMs, path: '', cwd: '/x', title: id, lastPrompt: '', gitBranch: '',
      permissionMode: '', messageCount: 0, lastActivityMs: mtimeMs, lastUserMs: 0,
-     firstActivityMs: 1, lastType: 'assistant', awaitingReply: false, isStub });
+     firstActivityMs: 1, lastType: 'assistant', awaitingReply: false, isStub,
+     entrypoint: 'cli', turns: 2, slashTitled: false });
 const a1 = fakeSession('a-old', 'uuid-a', 1000);
 const a2 = fakeSession('a-mid', 'uuid-a', 2000);
 const a3 = fakeSession('a-new', 'uuid-a', 3000);

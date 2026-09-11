@@ -33,6 +33,29 @@ continues there. orc follows the fork: each conversation shows as **one** row
 and a live pane's identity is re-pinned so restarting it resumes the newest
 file rather than a stale ancestor.
 
+## Hidden rows
+
+Headless `claude -p` runs write a transcript each, exactly like a real chat —
+so a batch of one-shot probes (an orchestrator drone checking permission rules,
+say) used to bury the sessions you care about under twenty junk rows. orc folds
+them away. A **history** row is hidden when:
+
+- its `cwd` is under `/tmp/claude-` — a session scratchpad, throwaway by
+  construction; **or**
+- it was launched headless (`entrypoint: sdk-cli`) *and* ran fewer than 20
+  turns *and* wasn't started by a slash command.
+
+That last clause is what keeps the scheduled jobs you *do* want: the 04:00
+`/morning-digest` run is headless too, but it's slash-titled, so it stays as its
+usual dated row. **A saved name (`n`) always wins** — name a session and it is
+never hidden, whatever else is true. Neither is a session that's live in an orc
+pane: if it's open, you're looking at it.
+
+Press **`h`** to unfold the hidden rows (shown dimmed, prefixed `· `) and again
+to fold them back; the default is folded. The count is never a mystery — the
+header reads `· 12 hidden`, or `· showing 12 hidden` while they're unfolded.
+`/` filters whatever is currently on screen.
+
 ## Order
 
 The list is sorted by **what last wanted you**: the session you most recently
@@ -48,7 +71,8 @@ whatever was waiting slides down.
 `↑↓`/`jk` move · `Enter` open (starts idle ones) → stage + focus · `Tab` focus
 the session · `n` **name/rename** the highlighted chat · `N` new session · `x`
 kill · `[` / `]` shrink/grow the sidebar (see below) · `/` filter ·
-`r` refresh · `?` **help** (a floating shortcut cheatsheet; `Esc` closes).
+`h` show/hide headless runs (see [Hidden rows](#hidden-rows)) · `r` refresh ·
+`?` **help** (a floating shortcut cheatsheet; `Esc` closes).
 
 A brand-new session (`N`) is labelled `new session` only until you send your
 first message — then it auto-renames to a short name derived from that prompt.
@@ -118,6 +142,7 @@ Requires `tmux` (already installed here).
 ```bash
 npm start          # bootstrap from source (tsx)
 npm run stagetest  # non-interactive: verify the stage swap + status logic
+npm run scannertest # non-interactive: transcript parsing + the hidden-row rule
 ```
 
 Hidden subcommands used internally by the dashboard: `orc __pane` (the Ink UI in

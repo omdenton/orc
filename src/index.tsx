@@ -3,7 +3,7 @@ import { render, Box, Text, useInput, useStdout } from 'ink';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import * as tmux from './tmux.js';
-import { scanSessions, canAdopt, collapseForks, attentionMs, type Session } from './scanner.js';
+import { scanSessions, canAdopt, collapseForks, attentionMs, isHidden, type Session } from './scanner.js';
 import { loadNames, setName } from './names.js';
 
 const ORC_BIN = fileURLToPath(new URL('../bin/orc.mjs', import.meta.url));
@@ -188,6 +188,10 @@ interface Row {
    *  Brand-new sessions with no transcript yet fall back to "now" so they
    *  surface at the top. */
   attention: number;
+  /** headless probe / scratchpad noise — folded away unless `h` is pressed
+   *  (see scanner.isHidden). Only ever true for a history row: a session
+   *  open in an orc pane is one the user is looking at. */
+  hidden: boolean;
   live?: tmux.LiveSession;
   historical?: Session;
 }
@@ -304,6 +308,7 @@ function buildRows(): Row[] {
         cwd: l.cwd,
         status,
         attention: attentionMs(h, busy(status)) || Date.now(),
+        hidden: false, // live in a pane — the user is looking at it
         live: l,
         historical: h,
       });
@@ -355,6 +360,7 @@ function buildRows(): Row[] {
       cwd: l.cwd,
       status,
       attention: attentionMs(h, busy(status)) || Date.now(),
+      hidden: false,
       live: l,
       historical: h,
     });
@@ -368,6 +374,7 @@ function buildRows(): Row[] {
       // Unowned but being written by a claude outside orc → not safe to resume.
       status: transcriptBusy(h.id, h.mtimeMs, h.awaitingReply) ? 'external' : 'idle',
       attention: attentionMs(h, false),
+      hidden: isHidden(h, names),
       historical: h,
     });
   }
@@ -408,6 +415,7 @@ const SHORTCUTS: [string, string][] = [
   ['x', 'kill the highlighted session'],
   ['[  ]', 'shrink / grow the sidebar'],
   ['/', 'filter the list'],
+  ['h', 'show / hide headless runs'],
   ['r', 'refresh now'],
   ['d', 'detach — leave sessions running'],
   ['q / Ctrl-C', 'quit orc + tear everything down'],
@@ -554,6 +562,9 @@ function Dashboard() {
   // could rename whatever drifted under the cursor.
   const [renameKey, setRenameKey] = useState('');
   const [help, setHelp] = useState(false);
+  // `h` unfolds the hidden rows (headless probes, scratchpad sessions). Off by
+  // default — that's the whole point — and the count is always on screen.
+  const [showHidden, setShowHidden] = useState(false);
 
   const refresh = useCallback(() => {
     const next = buildRows();
@@ -592,9 +603,12 @@ function Dashboard() {
   }, [hasRunning]);
   const spin = SPINNER_FRAMES[tick % SPINNER_FRAMES.length];
 
+  // Hiding comes first, `/` filters whatever that leaves — so a search never
+  // silently turns up rows the sidebar is meant to be folding away.
+  const visible = showHidden ? rows : rows.filter((r) => !r.hidden);
   const filtered = query
-    ? rows.filter((r) => (r.title + ' ' + r.cwd).toLowerCase().includes(query.toLowerCase()))
-    : rows;
+    ? visible.filter((r) => (r.title + ' ' + r.cwd).toLowerCase().includes(query.toLowerCase()))
+    : visible;
   // Re-derive the cursor position from the selected identity every render. If
   // the selected row vanished (killed) or a filter hid it, fall back to the
   // session on the stage — the one the user has open — and only then to the
@@ -771,12 +785,15 @@ function Dashboard() {
       adjustSidebar(4);
     } else if (input === '/') {
       setTyping(true);
+    } else if (input === 'h') {
+      setShowHidden((v) => !v);
     } else if (input === 'r') {
       refresh();
     }
   });
 
   const liveCount = rows.filter((r) => r.status === 'running' || r.status === 'ready').length;
+  const hiddenCount = rows.filter((r) => r.hidden).length;
   const start = Math.max(
     0,
     Math.min(clamped - Math.floor(visibleRows / 2), Math.max(0, filtered.length - visibleRows)),
@@ -792,7 +809,12 @@ function Dashboard() {
     <Box flexDirection="column" width={dims.cols} height={dims.rows - 1} overflow="hidden">
       <Box width={dims.cols}>
         <Text bold>orc</Text>
-        <Text dimColor> · {liveCount} live / {rows.length}</Text>
+        {/* The hidden count is never a mystery: the total counts what's on
+            screen, and the folded-away rows are spelled out next to it. */}
+        <Text dimColor> · {liveCount} live / {visible.length}</Text>
+        {hiddenCount > 0 && (
+          <Text dimColor>{showHidden ? ` · showing ${hiddenCount} hidden` : ` · ${hiddenCount} hidden`}</Text>
+        )}
       </Box>
       <Box width={dims.cols}>
         {renaming ? (
@@ -822,12 +844,16 @@ function Dashboard() {
               <Text>{active ? '❯ ' : '  '}</Text>
               <StatusGlyph status={r.status} spin={spin} />
               <Text> </Text>
+              {/* An unfolded hidden row is marked twice over — dimmed, and
+                  prefixed `· ` — so it reads as noise even when highlighted,
+                  where the cyan selection bar cancels the dimming. */}
               <Text
                 backgroundColor={active ? 'cyan' : undefined}
                 color={active ? 'black' : undefined}
+                dimColor={r.hidden && !active}
                 wrap="truncate"
               >
-                {pad(r.title, titleWidth)}
+                {pad((r.hidden ? '· ' : '') + r.title, titleWidth)}
               </Text>
             </Box>
           );
