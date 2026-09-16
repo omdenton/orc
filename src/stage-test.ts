@@ -157,7 +157,7 @@ check(
   'bg agents+workflow wait -> running',
   classifyCapture('node', `✻ Waiting for 2 background agents and 1 dynamic workflow to finish\n\n${inputBox}\n${MODE_IDLE}\n  ⧉  a · b`) === 'running',
 );
-check('shell command -> dead', classifyCapture('zsh', 'denton@host $ ') === 'dead');
+check('shell command -> dead', classifyCapture('zsh', 'user@host $ ') === 'dead');
 
 // Regression: the markers appearing in the CONVERSATION body must NOT trip the
 // classifier. A chat *about* orc's own status detection is full of these phrases

@@ -1,16 +1,41 @@
 {
   "name": "orc",
   "version": "0.1.0",
-  "description": "A tiny TUI launcher for resuming Claude Code sessions, with live status.",
+  "description": "A tmux-backed terminal dashboard for Claude Code sessions that keep running in the background.",
+  "license": "MIT",
+  "author": "Oliver Denton",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/omdenton/orc.git"
+  },
+  "homepage": "https://github.com/omdenton/orc#readme",
+  "bugs": {
+    "url": "https://github.com/omdenton/orc/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "tmux",
+    "tui",
+    "ink",
+    "dashboard",
+    "sessions"
+  ],
   "type": "module",
   "bin": {
     "orc": "./bin/orc.mjs"
   },
+  "files": [
+    "bin",
+    "src",
+    "SPEC.md"
+  ],
   "scripts": {
     "start": "tsx src/index.tsx",
     "dev": "tsx watch src/index.tsx",
     "stagetest": "ORC_SOCKET=orc-test tsx src/stage-test.ts",
-    "scannertest": "tsx src/scanner-test.ts"
+    "scannertest": "tsx src/scanner-test.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run scannertest && npm run stagetest"
   },
   "dependencies": {
     "ink": "^5.0.1",

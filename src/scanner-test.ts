@@ -55,7 +55,7 @@ function fixture(
   id: string,
   opts: { entrypoint: string | null; turns: number; firstPrompt?: string; cwd?: string },
 ): Session {
-  const cwd = opts.cwd ?? '/home/denton/projects/orc';
+  const cwd = opts.cwd ?? '/home/user/projects/orc';
   const recs: Rec[] = [];
   for (let i = 0; i < opts.turns; i++) {
     recs.push(
@@ -100,8 +100,8 @@ assert('no entrypoint field -> turns still counted', noField.turns === 4);
   writeFileSync(
     path,
     [
-      JSON.stringify(userRec('go', 'cli', '/home/denton')),
-      JSON.stringify({ ...assistantRec('cli', '/home/denton'), isSidechain: true }),
+      JSON.stringify(userRec('go', 'cli', '/home/user')),
+      JSON.stringify({ ...assistantRec('cli', '/home/user'), isSidechain: true }),
       JSON.stringify({ type: 'ai-title', aiTitle: 'something' }),
     ].join('\n') + '\n',
   );
@@ -116,8 +116,8 @@ assert('no entrypoint field -> turns still counted', noField.turns === 4);
   writeFileSync(
     path,
     [
-      JSON.stringify(userRec('go', '', '/home/denton')),
-      JSON.stringify(assistantRec('sdk-cli', '/home/denton')),
+      JSON.stringify(userRec('go', '', '/home/user')),
+      JSON.stringify(assistantRec('sdk-cli', '/home/user')),
     ].join('\n') + '\n',
   );
   assert("first record's empty entrypoint is not overwritten", parseFile(path, Date.now()).entrypoint === '');
@@ -156,7 +156,7 @@ assert("cwd '/tmp/claude' (no dash) -> shown", isHidden(nearMiss, NO_NAMES) === 
 const midPath = fixture('mid-path', {
   entrypoint: 'cli',
   turns: 4,
-  cwd: '/home/denton/tmp/claude-x',
+  cwd: '/home/user/tmp/claude-x',
 });
 assert("'/tmp/claude-' mid-path, not at the start -> shown", isHidden(midPath, NO_NAMES) === false);
 
