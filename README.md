@@ -11,16 +11,12 @@ and you are back where you were.
 Built on tmux, on its own isolated socket, so your normal tmux setup is never
 touched.
 
-```
-┌───────────────────────┬────────────────────────────────────┐
-│ orc · 1 live / 64      │  (the selected session, live)       │
-│ ↑↓ enter n x / q       │                                     │
-│  ▶ ecm-org-setup       │  ❯ …interactive claude, yours…      │
-│ ❯⠹ api-refactor        │                                     │
-│  ✓ digest              │  ⏵⏵ bypass permissions on           │
-│  ✓ notes               │                                     │
-└───────────────────────┴────────────────────────────────────┘
-```
+![orc: sessions down the left, the live one on the stage to the right](docs/orc-main.png)
+
+Left: every session, live or historical, with its status. Right: the selected
+session, a normal interactive Claude Code you type into. The spinner row is
+working in the background, the red cross is a session whose claude has exited,
+the green arrow is waiting on you, the grey ticks are history you can resume.
 
 ## Why
 
@@ -104,6 +100,8 @@ session's original directory, detached, then swaps it onto the stage.
 | `d` | **detach**: leave every session running, re-run `orc` to come back |
 | `q` / `Ctrl-C` | **quit**: tear down the dashboard and all hosted sessions |
 
+![the ? help overlay listing every shortcut](docs/orc-help.png)
+
 From inside a session, `Alt-←` / `Alt-h` moves focus back to the list and
 `Alt-→` / `Alt-l` moves it forward. Native tmux `Ctrl-b ←/→` and `Ctrl-b z`
 (zoom the session fullscreen) also work.
@@ -153,6 +151,8 @@ live in an orc pane.
 
 Press `h` to unfold hidden rows (dimmed, prefixed `· `) and again to fold them.
 The header shows the count either way: `· 12 hidden` or `· showing 12 hidden`.
+
+![the sidebar with six hidden headless probe runs unfolded and dimmed](docs/orc-hidden.png)
 
 ### Sidebar width and mouse
 
